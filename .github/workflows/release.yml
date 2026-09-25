@@ -30,6 +30,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             # Pre-release tags (v1.2.0-rc1) must not move :latest
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=sha
       - uses: docker/build-push-action@v7
         with:
           context: .
