@@ -1,10 +1,27 @@
 # Warcon player intelligence: implementation handoff
 
-Prepared 26 September 2026 UTC. Source baseline: Warcon commit [`0bc123cea2aee1e0b5e76c5c278badb2a03ce267`](https://github.com/warcon-app/warcon/tree/0bc123cea2aee1e0b5e76c5c278badb2a03ce267), committed 25 September at 22:31:41 UTC. The attached Shepherd screenshots are the visual feature reference. They are not evidence that its calculations are correct or that it has an additional WARDOGS API.
+Prepared 26 September 2026 UTC; **revised the same day for merge safety and deployment fit — see section 0.** Original source baseline: Warcon commit [`0bc123cea2aee1e0b5e76c5c278badb2a03ce267`](https://github.com/warcon-app/warcon/tree/0bc123cea2aee1e0b5e76c5c278badb2a03ce267), committed 25 September at 22:31:41 UTC. The attached Shepherd screenshots are the visual feature reference. They are not evidence that its calculations are correct or that it has an additional WARDOGS API.
 
 **Recommendation:** extend Warcon's existing player dossier with an organisation-scoped **Player intelligence** module, a staff review board, and an owner settings page. Keep collection in Warcon's existing ingestion/polling paths and run analysis in its existing worker. Store settings and review history in Postgres. No additional service, Redis, machine-learning model, or game modification is needed for the core dashboard.
 
 This is an implementation specification with concrete foundation code, not a completed Warcon patch. The configuration and scoring modules below passed 19 focused tests and strict TypeScript checking. Both Svelte components compiled without warnings against the repository's Svelte version. Database/API integration, live Steam requests, worker integration, and the full dashboard have not been implemented or tested here. All proposed route names below are **new Warcon routes**, not newly discovered game endpoints.
+
+## 0. Revision notes (26 September 2026, deployment review)
+
+This plan was reviewed against Warcon `main` at migration `0034_json_webhooks` and against the actual deployment it will run on: a fork at `github.com/Miracle-Whip/warcon`, images published by the fork's `release.yml` to `ghcr.io/miracle-whip/warcon`, and a single `WARCON_ROLE=all` container on a 1 GB RAM / 8.7 GB disk VPS. Every helper the appendix code imports (`route`, `apiJson`, `ApiError`, `param`, `readJson`, `userAgent`, `requireOrgRole`, `accessibleServers`, `serverAccessFor`, `redact`, `auditLog`) exists with the expected names, and the proposed capability IDs match the repository's dotted format (`players.notes`, `bans.manage`). The technical analysis in sections 1, 2, 4, 5, 7, 8, 9 and 11 stands. The changes below are about sequencing, merge safety and fit to this deployment; where they conflict with later sections, these notes win.
+
+| # | Change | Why |
+|---|---|---|
+| R1 | **Phases reordered to ship visible value first.** Phase 1 is a read-only dossier extension computed on demand from existing tables, using `DEFAULT_CONFIG` constants and touching no schema. Rollups, dirty-work queue, data epochs, snapshots, preview jobs, import/export and co-join analysis are deferred until a measured need (see revised section 3). | The whole database is ~155 MB. Subject queries hit the existing `kills_killer_idx (killer_steam_id, ts desc)`; fleet baselines are identical for every player and can be memoised in-process. The deferred machinery exists to make large-scale caching correct, and it is the part most likely to be built wrong by a first-time contributor. The plan's own item 15 says to choose limits from measurement. |
+| R2 | **Separate migration track.** Intelligence migrations live in `drizzle/intel/` with their own `meta/_journal.json` and their own tracking table `drizzle.__intel_migrations`, run by a three-line hook in upstream's `runMigrations()` (`src/lib/server/db/index.ts`). Intelligence tables are defined outside `src/lib/server/db/schema.ts`. | Adding `0035_intel_*` to upstream's journal guarantees a conflict on `drizzle/meta/_journal.json`, and a duplicate `0035` index, the next time upstream ships a migration. Upstream shipped seven in one week. `drizzle/intel/` is inside the directory the Dockerfile already copies, so no Dockerfile edit is needed. |
+| R3 | **Upstream-touch budget.** Only the files listed in revised section 10 may change; every touch is recorded in `docs/intelligence/UPSTREAM-TOUCHES.md`. | Each upstream file touched is a future merge conflict. The list makes conflicts predictable and reviewable. |
+| R4 | **No built-in role migration for the MVP.** | Warcon's README states org owners and the site owner hold every capability. Owners can use the feature immediately; staff are granted `players.intelligence.read` / `.review` through the existing role editor. |
+| R5 | **Weapon catalog replaces the placeholder allowlist.** `src/lib/intelligence/weapons.ts` (supplied separately) maps every tag seen in this deployment's feed to its in-game shop name and class, decides which classes are scored, and seeds `DEFAULT_CONFIG.filters.scoredWeaponTags` (`SCORED_WEAPON_TAGS`, 26 tags) and `weaponOverrides` (`DEFAULT_WEAPON_OVERRIDES`). The seeded config passes `IntelligenceConfigSchema`. Stored `kills.cause` values are never rewritten; the UI displays `weaponInfo(tag).name` with the raw tag available on hover. Tags not in the catalog fall back to upstream's `causeLabel()` and are shown but unscored. | The game sends internal tags (`Id.Item.WEPN_029`, `Id.Item.Vector`), not shop names (Galil, Super-45). Tags are the stable identifier and must stay the grouping key; names are presentation. Upstream's `src/lib/causes.ts` labels some tags with real-world names that differ from the shop (Glock 17 vs GGX 17, TAR-21 vs T-21) and lacks many; editing it in the fork would conflict whenever upstream adds a label, so the module keeps its own catalog. Upstream's `causeKind()` classifies grenades, AT mines, hammers and defibrillators as `weapon`, which is why scoring uses an explicit catalog. |
+| R10 | **Long-range cutoff per weapon class.** Assault rifle and LMG 150 m, marksman 200 m, sniper 300 m; the rule is off for SMGs, pistols and shotguns. Implemented as `weaponOverrides` seeded from the catalog. | On this deployment's data the Mosin averages 166 m and the SV98 256 m per kill, so with one 150 m cutoff most sniper kills are already "long range" and the rule cannot separate a strong sniper from anyone else. SMGs (24-31 m) and pistols (5-20 m) essentially never reach 150 m, so the rule could only report "no evidence" for them. |
+| R6 | **Development with a copy of production data must use a different `ENCRYPTION_KEY`.** | RCON passwords and webhook addresses are encrypted with that key. A dev instance holding the production key and production data will poll live game servers, enforce bans on sight and post to real webhooks. A fresh key makes those decrypts fail harmlessly. Never point a dev instance at the production database. |
+| R7 | **Deployment rewritten for the actual pipeline** (revised section 10). Upstream syncs go through a pull request so CI runs *before* anything reaches `main`. | `release.yml` publishes on every push to `main` and does not wait for CI. GitHub's Sync fork button pushes straight to `main`, so a sync that breaks custom code would publish a broken `latest`. |
+| R8 | **Resource ceiling.** 1 GB RAM, ~3 GB free disk, no local builds. Background work stays bounded and off by default; snapshot/rollup tables are the main new disk consumer when they arrive. | Upstream migration `0030` removed kill/sample retention, so disk growth is already permanent on this box. |
+| R9 | **Expect "insufficient sample" for weeks.** | The kill feed on this deployment was enabled 24 September 2026. The default minimums (500 peer kills, 30 peer players per cohort) will not be met immediately. The UI must show the unmet requirement, not a finding. This is the correct initial state, not a bug. |
 
 ## 1. What to implement from the screenshots
 
@@ -48,18 +65,27 @@ The inspected application uses Bun, SvelteKit/Svelte 5, Drizzle, Postgres and op
 | `src/lib/server/stats.ts` | Purging server statistics must also invalidate/delete derived intelligence so deleted evidence cannot reappear from caches. |
 | `src/lib/server/lists.ts`, `lists-sync.ts`, existing ban dialogs | Preserve the existing explicit ban action and its permission checks. The intelligence module does not become a second ban authority. |
 
-Organise new code under `src/lib/intelligence/` for shared types/validation/pure scoring and `src/lib/server/intelligence/` for queries, settings, jobs, cache and cases. Add UI components under `src/lib/components/intelligence/`. This keeps changes to upstream files small and easier to merge when Warcon updates.
+Organise new code under `src/lib/intelligence/` for shared types/validation/pure scoring and `src/lib/server/intelligence/` for queries, settings, jobs, cache and cases. Add UI components under `src/lib/components/intelligence/`. This keeps changes to upstream files small and easier to merge when Warcon updates. The permitted upstream touches are enumerated in revised section 10 (R3).
 
-## 3. Implement in this order
+## 3. Implement in this order (revised, see R1)
 
-1. **Configuration, permissions and provenance.** Add validated organisation settings, revision history, staff capabilities and the settings screen. Register migrations through Drizzle, including its metadata files. Start disabled with shadow mode selected. The defaults in the appendix are proposed starting values, not validated WARDOGS cheating thresholds.
-2. **A factual dossier extension.** Add weapon statistics, distance/timeline charts, paginated session/match history and opponent tables. Every card must state date range, server scope, data source and freshness. Preserve explicit unknown/no-feed states. No scoring is required to make this useful.
-3. **Comparison engine and worker.** Add cohort aggregates, self-excluding peer comparisons, trustworthy burst calculations, persisted dirty work and versioned snapshots. Enable shadow mode on a test deployment. The same pure function must evaluate preview, live analysis and replay.
-4. **Review workflow.** Add the board, cases, manual reports, evidence links and export. Generate board entries only in review mode. Keep explicit ban actions in existing dialogs. A threshold crossing must not call a game mutation.
-5. **Steam enrichment and relationships.** Add optional enrichment and friend-edge caching, then session overlap analysis. These can fail independently without blocking the combat dashboard.
-6. **Deployment and tuning.** Test with a copied database or isolated test data, run in shadow mode, inspect the flagged examples, then enable the review board. A small community may need days of play to meet peer sample requirements; a successful deployment does not instantly create a useful baseline.
+Each phase ends with a deploy to the VPS. Phase 1 deliberately changes no schema, so the first trip through branch → pull request → CI → GHCR → VPS cannot damage data.
 
-Do all six as one development branch if desired, but preserve those dependency boundaries and tests. There is no reason to wait for text chat or mod support for these features. Conversely, this work does not supply missing chat, shot trajectories, mouse input, aim angles or line-of-sight telemetry.
+**Phase 0 — Guard rails (no deploy).** Development environment per R6; baseline `bun test`, `bun run check`, `bun run lint` and `bun run build` passing on unmodified code; `docs/intelligence/plan.md` (this file) and `docs/intelligence/UPSTREAM-TOUCHES.md` committed; weapon tags inventoried per R5.
+
+**Phase 1 — Read-only dossier extension, computed on demand.** Register `players.intelligence.read` and `players.intelligence.review` (upstream touch: `src/lib/capabilities.ts`). Add `GET /api/servers/:id/players/:steamId/intelligence` and a page at `/server/[id]/players/[steamId]/intelligence`, linked from the existing dossier only when the read capability is held (upstream touch: the dossier `+page.svelte`, one link). Contents: KPI strip (kills on record, headshot share vs matched fleet, long-range headshots, max kills in a validated 60 s window, recorded-match K/D, observed minutes, first seen), weapons-vs-fleet table with the section 5 definitions and sample-size gating, kill timeline, distance histogram, and the existing sessions and opponent data. Scoring via the appendix `score.ts` is displayed as review priority with every unmet requirement named. Thresholds come from `DEFAULT_CONFIG`; changing them needs a code change until phase 2. Fleet baselines are memoised in-process for ten minutes keyed by sorted server set, lookback and algorithm version; clear the memo on stats purge. No new tables, no worker changes.
+
+**Phase 2 — Persisted settings.** Add the intelligence migration track (R2, appendix), `intelligence_settings` and `intelligence_settings_revisions`, the appendix settings route and generic editor at `/orgs/[id]/intelligence`. The dossier reads the saved config, falling back to defaults. Save, reload, load defaults and revision history; preview/import/export stay deferred.
+
+**Phase 3 — Review board, manual first.** `intelligence_cases`, `intelligence_case_events`, `intelligence_reports`; board at `/intelligence/[orgId]`; staff create cases from a dossier, assign, note, clear or escalate; copy-case text with the as-of warning. The board lists open cases, not a background scan of every player.
+
+**Phase 4 — Background evaluation, only if phase 3 shows the need.** A bounded worker job under the existing lease (`poller.ts`, `withOwnedTransaction()`) evaluates recently active players and upserts automatic cases in review mode. This is where `intelligence_dirty`, `intelligence_data_epochs` and `intelligence_snapshots` become necessary, with the purge fencing from section 6. Measure memory and query time on the VPS before enabling.
+
+**Phase 5 — Steam enrichment and relationships.** Section 8 enrichment, then friend edges, then co-join analysis. Each fails independently of the combat dossier.
+
+**Deferred until measured need:** `intelligence_rollups`, preview jobs, JSON import/export. Revisit rollups only if dossier queries on the VPS exceed roughly 500 ms at realistic data volume.
+
+The boundaries and tests from the original plan still apply to whatever phase introduces them. This work does not supply missing chat, shot trajectories, mouse input, aim angles or line-of-sight telemetry.
 
 ## 4. Configuration must be a saved product feature
 
@@ -107,7 +133,11 @@ Save settings to Postgres, not to the container filesystem or compiled constants
 
 ## 6. Data model and background work
 
-Use ordinary Postgres tables for module state. Preserve the existing kills table and its Timescale behavior. The following are implementation contracts, not already-existing tables:
+Use ordinary Postgres tables for module state. Preserve the existing kills table and its Timescale behavior.
+
+**Revised phasing of these tables (R1, R2).** Phase 1 creates none of them. Phase 2 adds the two settings tables; phase 3 the case, event and report tables; phase 4 the dirty, epoch and snapshot tables; phase 5 the Steam tables. `intelligence_rollups` is deferred. Every table is created through the separate `drizzle/intel/` migration track, defined outside upstream's `schema.ts`, and additive only: an unmodified upstream image must still boot against a database that contains them.
+
+The following are implementation contracts, not already-existing tables:
 
 | New table | Key / data / lifecycle |
 |---|---|
@@ -191,15 +221,26 @@ The review board supports open → reviewing → cleared/escalated, with reopeni
 
 Automatic threshold crossings upsert one open case for the same player/scope and attach updated findings only after the configured cooldown or a meaningful escalation. Rebuilding after a config change should produce a labelled rescore, not hundreds of pretend new incidents. Staff-entered reports are deduplicated by real report identity; repeated messages from one source do not become several independent witnesses. Leave external notifications off initially; if later enabled, use the existing authorised outbox/webhook system with a new explicitly registered event and no game-action mapping.
 
-## 10. Deployment and keeping upstream updates
+## 10. Deployment and keeping upstream updates (revised, see R2, R3, R7)
 
-Maintain the feature on a fork/branch. Merge upstream changes, run Warcon's checks, then build an image from the resulting commit. The inspected upstream CI builds/tests an image with `push: false`; do not assume it publishes a pullable current image for this custom feature.
+**Branches.** `upstream/main` is `warcon-app/warcon` and is never written to. The fork's `main` is what deploys: upstream plus the intelligence module. Work happens on short-lived branches (`intel/phase-1`, `sync/2026-10-02`) that reach `main` only through a pull request whose base is **`Miracle-Whip/warcon` `main`** — GitHub defaults a fork's pull requests to the upstream repository, and that default must be changed every time.
 
-For your NAS/VPS workflow, the long-term target is a private or public registry image built by your fork's CI, with the **same image digest for web, worker and migration jobs**. Keep the existing working Compose database volumes, connection variables, tunnel/ports and service commands. Change image references to your fork's published image after it exists. Use a tested release tag or digest, and promote new commits after tests. Pulling the unmodified upstream image would remove custom code while leaving your database data behind.
+**Pipeline.** `ci.yml` runs lint, check, tests, build and smoke on every pull request. Merging into `main` triggers `release.yml`, which publishes `ghcr.io/miracle-whip/warcon:latest` and an immutable `sha-<commit>` tag. On the VPS, `/opt/warcon/update.sh` backs up the database, pulls `latest`, restarts the single `WARCON_ROLE=all` container (which applies upstream migrations and then the intelligence track), waits for health and reports migration levels. Rollback is pinning the previous `sha-` tag plus the script's pre-update dump. `release.yml` does not wait for CI, so a green pull request is the gate; nothing reaches `main` without one.
 
-Do not edit JavaScript inside a running container or copy a settings file into its writable layer. Those changes disappear at recreation. Saved organisation config, revisions and case history belong in the backed-up database. Run migrations once before starting both roles; current Warcon checks for pending migrations. Back up before the first schema update, use additive changes where practical, and keep the prior image digest for rollback. A rollback image must tolerate the added tables/schema; do not delete database volumes to roll back code.
+**Upstream syncs.** Stop using the Sync fork button once custom code exists: it pushes straight to `main`, publishes without tests, and its "Discard commits" option would delete the entire module. Instead, merge `upstream/main` into a `sync/<date>` branch locally, resolve conflicts, run the checks, and open a pull request. Conflicts should be confined to the upstream-touch list below; a conflict anywhere else means the module has leaked into upstream code.
 
-Keep the existing RCON/feed configuration. This module adds analysis of already-ingested events; it should not increase game-server polling just to repaint its dashboard. Verify results update on receipt of a new kill, after a worker restart and after saving configuration without recreating containers.
+**Upstream-touch budget.** Only these upstream files may change, each with the smallest possible edit, each recorded in `docs/intelligence/UPSTREAM-TOUCHES.md` with the reason:
+
+| Upstream file | Change | Phase |
+|---|---|---|
+| `.github/workflows/release.yml` | Trigger on push to `main`; `type=sha` tag. Already done. | — |
+| `src/lib/capabilities.ts` | Two capability IDs and their `CAPABILITY_INFO` entries | 1 |
+| `src/routes/(app)/server/[id]/players/[steamId]/+page.svelte` | One capability-gated link to the intelligence page | 1 |
+| `src/lib/server/db/index.ts` | Intelligence migration hook in `runMigrations()` (appendix) | 2 |
+| `src/lib/server/stats.ts` | Purge invalidates intelligence caches and derived tables | 1 (memo), 4 (tables) |
+| `src/lib/server/poller.ts` | Register the bounded evaluation job | 4 |
+
+**Rules carried over.** Never edit code inside a running container. Settings, revisions and cases live in the backed-up database. Back up before every update; `update.sh` does this and aborts if the dump fails. Intelligence migrations are additive so a rollback image tolerates them; never delete database volumes to roll back code. The module analyses already-ingested events and must not increase game-server polling.
 
 ## 11. Acceptance tests and definition of done
 
@@ -221,11 +262,13 @@ The 19 appendix tests cover the pure configuration/scoring foundation. These int
 14. Case creation, reports and retries are idempotent; assignment/status history is attributable; clipped/page-limited results disclose their limit. CSV exports, if added, escape spreadsheet formulas.
 15. Run `bun run check`, relevant Bun unit/integration suites, the full existing permission/risk/list regression suites, `bun run build`, and Docker migration/role smoke checks. Test fresh install and upgrade of a populated database. On the intended VPS, measure ingestion/polling latency, memory and query plans while rebuilding; choose limits from results instead of claiming a capacity estimate as fact.
 
+16. **Merge isolation (R2, R3).** Upstream's `drizzle/meta/_journal.json` and `src/lib/server/db/schema.ts` are byte-identical to `upstream/main`. A fresh install applies upstream migrations then the intelligence track. An upgrade of a populated database does the same. The unmodified upstream image boots against a database that contains the intelligence tables. `git diff upstream/main --stat` with the module's folders excluded (use `:(exclude,literal)` pathspecs so SvelteKit's `[id]` folders are not read as glob patterns; the guide has the exact command) lists only the upstream-touch budget.
+
 The feature is done when a staff member can find a player, inspect a correctly scoped dossier, understand each finding, change thresholds through the owner UI, preview and save them, see revised results without a code rebuild, manage a case, and continue updating the container without losing configuration. Every screenshot feature above must be either implemented with its stated data source or shown as explicitly unavailable; do not fill gaps with fabricated endpoints or statistics.
 
 ## Appendix: code foundation
 
-The following files are new code for this plan. Copy them to the specified target paths during implementation. They establish the configuration/scoring/save/edit mechanism; implement the remaining services, routes and dashboard described above around them. In the pure files, `./config.ts` imports work in Bun; adapt extension style to the repository's lint convention if required.
+The following files are new code for this plan. Copy them to the specified target paths during implementation. The weapon catalog `src/lib/intelligence/weapons.ts` (R5, R10) is supplied as a separate file alongside this plan rather than inlined here; copy it to that path unchanged. They establish the configuration/scoring/save/edit mechanism; implement the remaining services, routes and dashboard described above around them. In the pure files, `./config.ts` imports work in Bun; adapt extension style to the repository's lint convention if required.
 
 The example settings route writes an atomic local audit row and configuration revision. It does not send notifications. During integration, the worker must poll revisions and enqueue missing builds as specified; adding only this route will persist settings but will not run any analysis. Do not claim live configuration is finished until that worker path is wired.
 
@@ -343,6 +386,9 @@ export const DEFAULT_CONFIG: IntelligenceConfig = IntelligenceConfigSchema.parse
   baseline: { lookbackDays: 30, cohort: 'weapon_mode', minPeerKills: 500,
     minPeerPlayers: 30, minComparableCoveragePct: 80, sinceUtc: null, label: '' },
   filters: { requireKnownEnemy: true, excludeTeamKills: true,
+    // REVISED (R5): placeholder. At implementation, set scoredWeaponTags to
+    // SCORED_WEAPON_TAGS and weaponOverrides to DEFAULT_WEAPON_OVERRIDES from
+    // src/lib/intelligence/weapons.ts.
     scoredWeaponTags: ['Id.Item.AK74M', 'Id.Item.M4', 'Id.Item.M500',
       'Id.Item.MP43', 'Id.Item.SKS', 'Id.Item.SVDM', 'Id.Item.KH2002',
       'Id.Item.TAR21', 'Id.Item.A91', 'Id.Item.SV98', 'Id.Item.MK22',
@@ -503,11 +549,14 @@ export function maxRollingBurst(events: TimedKill[], seconds: number, minDistinc
 }
 ```
 
-### Reference settings migration (generate through Drizzle)
+### Reference settings migration (revised: separate `drizzle/intel/` track, see R2)
 
 ```sql
--- Reference DDL. Implement matching Drizzle table definitions in db/schema.ts;
--- generate and commit the migration plus drizzle/meta journal/snapshot files.
+-- drizzle/intel/0000_intel_settings.sql  (phase 2)
+-- Separate track: do NOT add this to upstream's drizzle/meta/_journal.json and do
+-- NOT define these tables in src/lib/server/db/schema.ts. For typed queries, define
+-- the tables in src/lib/server/intelligence/db.ts. Separate statements with
+-- '--> statement-breakpoint' lines, as upstream's migrations do.
 CREATE TABLE intelligence_settings (
   org_id text PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
   revision integer NOT NULL CHECK (revision >= 1),
@@ -524,6 +573,35 @@ CREATE TABLE intelligence_settings_revisions (
   PRIMARY KEY (org_id, revision)
 );
 ```
+
+**Track journal** — `drizzle/intel/meta/_journal.json`. The Drizzle migrator reads only this journal and the `.sql` files, so it can be written by hand. `when` is epoch milliseconds and must strictly increase with each entry; the migrator applies entries newer than the last one recorded in `drizzle.__intel_migrations`.
+
+```json
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    { "idx": 0, "version": "7", "when": 1790400000000, "tag": "0000_intel_settings", "breakpoints": true }
+  ]
+}
+```
+
+**Migration hook** — the only change to `src/lib/server/db/index.ts`. Both call sites (`src/lib/server/env.ts` for `WARCON_ROLE=all` and `src/worker/migrate.ts` for the `migrate` role) go through this function, so one edit covers both. It is a no-op until the track exists.
+
+```typescript
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+export async function runMigrations(db: Db, migrationsFolder: string): Promise<void> {
+	await migrate(db, { migrationsFolder });
+	// warcon-intel: separate track so upstream's journal never conflicts (plan R2).
+	const intel = join(migrationsFolder, 'intel');
+	if (existsSync(join(intel, 'meta', '_journal.json')))
+		await migrate(db, { migrationsFolder: intel, migrationsTable: '__intel_migrations' });
+}
+```
+
+Verify after the first deploy: `SELECT * FROM drizzle.__intel_migrations;` returns one row per applied intelligence migration, and `drizzle.__drizzle_migrations` is unchanged in count.
 
 ### src/routes/api/orgs/[id]/intelligence/settings/+server.ts
 
