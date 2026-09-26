@@ -204,7 +204,8 @@ function prefixClass(t: string): WeaponClass {
 
 /** Display name, class and scoring for any cause tag. Never throws. */
 export function weaponInfo(tag: string | null | undefined): WeaponInfo {
-	if (!tag) return { tag: '', name: '', class: 'unknown', scored: false, longRangeM: null, known: false };
+	if (!tag)
+		return { tag: '', name: '', class: 'unknown', scored: false, longRangeM: null, known: false };
 	const t = tag.toLowerCase();
 	let name: string | undefined;
 	let cls: WeaponClass | undefined;
@@ -232,16 +233,48 @@ export function weaponInfo(tag: string | null | undefined): WeaponInfo {
 
 /** Every Id.Item tag seen in this deployment's feed up to 2026-09-26, exactly as sent. */
 export const OBSERVED_ITEM_TAGS = [
-	'Id.Item.WEPN_029', 'Id.Item.M4', 'Id.Item.AK74M', 'Id.Item.SVDM', 'Id.Item.Mosin',
-	'Id.Item.SKS', 'Id.Item.TAR21', 'Id.Item.Vector', 'Id.Item.MP9', 'Id.Item.M249',
-	'Id.Item.SV98', 'Id.Item.M500', 'Id.Item.WEPN_032', 'Id.Item.SMG_03', 'Id.Item.WEPN_028',
-	'Id.Item.CombatBow', 'Id.Item.M67Grenade', 'Id.Item.KH2002', 'Id.Item.Glock17',
-	'Id.Item.MP43', 'Id.Item.Launcher_04', 'Id.Item.A91', 'Id.Item.WEPN_035',
-	'Id.Item.WEPN_027', 'Id.Item.WEPN_033', 'Id.Item.WEPN_026', 'Id.Item.RPG7',
-	'Id.Item.Defibrillator.Standard', 'ID.Item.ATMine', 'Id.Item.CGM4', 'Id.Item.C4Explosive',
-	'ID.Item.BuildTool.Hammer.Large', 'Id.Item.LMG_02', 'Id.Item.Fists', 'Id.Item.MK22',
-	'Id.Item.Claymore', 'ID.Item.BuildTool.Hammer.Medium', 'Id.Item.Judge', 'Id.Item.MMGL',
-	'Id.Item.IED.Explosive', 'Id.Item.Crowbar', 'ID.Item.BuildTool.Hammer.Small'
+	'Id.Item.WEPN_029',
+	'Id.Item.M4',
+	'Id.Item.AK74M',
+	'Id.Item.SVDM',
+	'Id.Item.Mosin',
+	'Id.Item.SKS',
+	'Id.Item.TAR21',
+	'Id.Item.Vector',
+	'Id.Item.MP9',
+	'Id.Item.M249',
+	'Id.Item.SV98',
+	'Id.Item.M500',
+	'Id.Item.WEPN_032',
+	'Id.Item.SMG_03',
+	'Id.Item.WEPN_028',
+	'Id.Item.CombatBow',
+	'Id.Item.M67Grenade',
+	'Id.Item.KH2002',
+	'Id.Item.Glock17',
+	'Id.Item.MP43',
+	'Id.Item.Launcher_04',
+	'Id.Item.A91',
+	'Id.Item.WEPN_035',
+	'Id.Item.WEPN_027',
+	'Id.Item.WEPN_033',
+	'Id.Item.WEPN_026',
+	'Id.Item.RPG7',
+	'Id.Item.Defibrillator.Standard',
+	'ID.Item.ATMine',
+	'Id.Item.CGM4',
+	'Id.Item.C4Explosive',
+	'ID.Item.BuildTool.Hammer.Large',
+	'Id.Item.LMG_02',
+	'Id.Item.Fists',
+	'Id.Item.MK22',
+	'Id.Item.Claymore',
+	'ID.Item.BuildTool.Hammer.Medium',
+	'Id.Item.Judge',
+	'Id.Item.MMGL',
+	'Id.Item.IED.Explosive',
+	'Id.Item.Crowbar',
+	'ID.Item.BuildTool.Hammer.Small'
 ] as const;
 
 /**
