@@ -5,7 +5,15 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
 import { eq } from 'drizzle-orm';
 import type { Env } from '$lib/server/env';
-import { kills, matches, matchPlayers, playerSessions, servers } from '$lib/server/db/schema';
+import {
+	kills,
+	matches,
+	matchPlayers,
+	orgRoles,
+	playerSessions,
+	servers
+} from '$lib/server/db/schema';
+import { BUILTIN_CAPABILITIES } from '$lib/capabilities';
 import type { IntelligenceView } from '$lib/intelligence/types';
 import { hasTestDb, testEnv } from '../../../test/db';
 import { callApi, stubGateway } from '../../../test/call';
@@ -130,7 +138,8 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 		expect((await read('elsewhere')).status).toBe(404);
 		expect((await read('outsider')).status).toBe(404);
 		expect((await read('owner')).status).toBe(200);
-		expect((await read('admin')).status).toBe(200);
+		// the built-in admin does not hold it: an owner grants it (plan R4)
+		expect((await read('admin')).status).toBe(403);
 	});
 
 	test('the peers exclude the subject and count a player on two servers once', async () => {
@@ -173,6 +182,11 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 	});
 
 	test('a reader with intelligence on one server sees that server only', async () => {
+		// the owner adds it to the admin role, which `admin` holds on this server alone
+		await env.db
+			.update(orgRoles)
+			.set({ capabilities: [...BUILTIN_CAPABILITIES.admin, 'players.intelligence.read'] })
+			.where(eq(orgRoles.id, w.roles.admin));
 		const { view } = await read('admin');
 		expect(view!.scope.servers.map((s) => s.id)).toEqual([w.server.id]);
 		const m4 = view!.weapons.find((r) => r.weapon === M4 && r.modeKnown)!;

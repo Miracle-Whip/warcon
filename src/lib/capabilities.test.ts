@@ -22,7 +22,7 @@ describe('catalogue', () => {
 		const { viewer, operator, admin } = BUILTIN_CAPABILITIES;
 		for (const c of viewer) expect(operator).toContain(c);
 		for (const c of operator) expect(admin).toContain(c);
-		expect(admin.length).toBe(CAPABILITIES.length);
+		expect(admin).toEqual(CAPABILITIES.filter((c) => !c.startsWith('players.intelligence.')));
 		expect(viewer).toEqual([VIEW]);
 	});
 });

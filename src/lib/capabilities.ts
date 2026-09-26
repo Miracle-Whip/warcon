@@ -180,7 +180,10 @@ const OPERATOR: Capability[] = [
 export const BUILTIN_CAPABILITIES: Record<BuiltinRole, Capability[]> = {
 	viewer: ['server.view'],
 	operator: OPERATOR,
-	admin: [...CAPABILITIES]
+	// warcon-intel: player intelligence is granted by an owner, never built in (plan R4)
+	admin: CAPABILITIES.filter(
+		(c) => c !== 'players.intelligence.read' && c !== 'players.intelligence.review'
+	)
 };
 
 export const isBuiltinRole = (v: unknown): v is BuiltinRole =>
