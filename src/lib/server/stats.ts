@@ -8,6 +8,7 @@ import { sql } from 'drizzle-orm';
 import type { Env } from './env';
 import type { ServerRow, SessionUser } from './access';
 import { writeAudit } from './audit';
+import { clearFleetMemo } from './intelligence/memo';
 
 export interface PurgeCounts {
 	kills: number;
@@ -33,6 +34,8 @@ export async function purgeServerStats(
 		const matches = await del('matches');
 		return { kills, matches, matchPlayers };
 	});
+	// warcon-intel: purged kills must not live on in memoised fleet baselines.
+	clearFleetMemo();
 	await writeAudit(env, req, {
 		actor,
 		server: { id: server.id, name: server.name },

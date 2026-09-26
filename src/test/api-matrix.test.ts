@@ -129,6 +129,7 @@ const MATRIX: Record<string, Policy | typeof PER_LIST> = {
 	'GET api/servers/[id]/lists/state': 'cap:server.view',
 	'GET api/servers/[id]/players/[steamId]': 'cap:server.view',
 	'GET api/servers/[id]/players/[steamId]/career': 'cap:server.view',
+	'GET api/servers/[id]/players/[steamId]/intelligence': 'cap:players.intelligence.read',
 	'POST api/servers/[id]/players/[steamId]/steam': 'cap:server.view',
 	'GET api/servers/[id]/players/marks': 'cap:server.view',
 	'GET api/servers/[id]/players/seen': 'cap:server.view',

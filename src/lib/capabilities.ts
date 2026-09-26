@@ -20,7 +20,10 @@ export const CAPABILITIES = [
 	'config.apply',
 	'automation.manage',
 	'audit.read',
-	'rcon.raw'
+	'rcon.raw',
+	// warcon-intel: player intelligence (docs/intelligence/plan.md)
+	'players.intelligence.read',
+	'players.intelligence.review'
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -120,6 +123,17 @@ export const CAPABILITY_INFO: Record<Capability, CapabilityInfo> = {
 		label: 'Raw RCON',
 		hint: 'Call any /v1 route on the game server directly, except the config document.',
 		group: 'manage'
+	},
+	// warcon-intel: player intelligence (docs/intelligence/plan.md)
+	'players.intelligence.read': {
+		label: 'Player intelligence',
+		hint: "Open a player's intelligence page: headshot and long-range comparisons with other players, kill bursts and review priority, across the servers where the role holds it. Review signals only; nothing is sent to the game.",
+		group: 'read'
+	},
+	'players.intelligence.review': {
+		label: 'Intelligence review',
+		hint: 'Open, assign and close review cases and add reports once the review board exists. Needs Player intelligence as well.',
+		group: 'moderate'
 	}
 };
 
@@ -166,7 +180,10 @@ const OPERATOR: Capability[] = [
 export const BUILTIN_CAPABILITIES: Record<BuiltinRole, Capability[]> = {
 	viewer: ['server.view'],
 	operator: OPERATOR,
-	admin: [...CAPABILITIES]
+	// warcon-intel: player intelligence is granted by an owner, never built in (plan R4)
+	admin: CAPABILITIES.filter(
+		(c) => c !== 'players.intelligence.read' && c !== 'players.intelligence.review'
+	)
 };
 
 export const isBuiltinRole = (v: unknown): v is BuiltinRole =>
