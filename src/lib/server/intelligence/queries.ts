@@ -17,8 +17,8 @@ const at = (t: number) => sql`${new Date(t).toISOString()}::timestamptz`;
 /**
  * The recorded match a kill was attached to at receipt, only where that attachment is credible:
  * the same server, the kill inside the match's time (the start is estimated, hence the two
- * minutes upstream allows too) and on the match's map. Anything else is an unknown match, never
- * the neighbouring one.
+ * minutes upstream allows too) and on the match's map. Burst timing alone reads it, to place a
+ * kill on a match clock; it never filters or groups the comparisons (plan R11).
  */
 const credibleMatch = sql`
 	LEFT JOIN matches m ON m.id = k.match_row AND m.server_id = k.server_id
@@ -53,7 +53,10 @@ function cutoffs(c: IntelligenceConfig): SQL {
 	return sql`LEFT JOIN ${table} AS lr(tag, dist) ON lr.tag = k.cause`;
 }
 
-/** The fleet's per-cell totals over [from, asOf]: every player, the subject included. */
+/**
+ * The fleet's per-weapon totals over [from, asOf]: every player, the subject included, grouped by
+ * the exact tag alone. No match is joined, so a kill with no linked match counts like any other.
+ */
 export async function fleetCells(
 	env: Env,
 	c: IntelligenceConfig,
@@ -62,16 +65,8 @@ export async function fleetCells(
 	asOf: number
 ): Promise<FleetCell[]> {
 	if (!serverIds.length) return [];
-	const cohort = c.baseline.cohort;
-	const mode =
-		cohort === 'weapon'
-			? sql`NULL::text`
-			: sql`CASE WHEN m.id IS NOT NULL THEN NULLIF(m.experiences, '') END`;
-	const map = cohort === 'weapon_mode_map' ? sql`k.map` : sql`NULL::text`;
 	const rows = await env.db.execute<{
 		weapon: string;
-		mode: string | null;
-		map: string | null;
 		kills: string;
 		headshots: string;
 		players: string;
@@ -80,26 +75,22 @@ export async function fleetCells(
 		lrPlayers: string;
 	}>(sql`
 		WITH e AS (
-			SELECT k.killer_steam_id AS killer, k.cause AS weapon, ${mode} AS mode, ${map} AS map,
-			       k.headshot,
+			SELECT k.killer_steam_id AS killer, k.cause AS weapon, k.headshot,
 			       (k.distance_m IS NOT NULL AND lr.dist IS NOT NULL AND k.distance_m >= lr.dist) AS lr
 			  FROM kills k
-			  ${cohort === 'weapon' ? sql`` : credibleMatch}
 			  ${cutoffs(c)}
 			 WHERE k.server_id IN ${serverIds} AND k.ts >= ${at(from)} AND k.ts <= ${at(asOf)}
 			   AND ${eligible(c)})
-		SELECT weapon, mode, map, COUNT(*) AS kills,
+		SELECT weapon, COUNT(*) AS kills,
 		       COUNT(*) FILTER (WHERE headshot) AS headshots,
 		       COUNT(DISTINCT killer) AS players,
 		       COUNT(*) FILTER (WHERE lr) AS "lrKills",
 		       COUNT(*) FILTER (WHERE lr AND headshot) AS "lrHeadshots",
 		       COUNT(DISTINCT killer) FILTER (WHERE lr) AS "lrPlayers"
-		  FROM e ${cohort === 'weapon' ? sql`` : sql`WHERE mode IS NOT NULL`}
-		 GROUP BY weapon, mode, map`);
+		  FROM e
+		 GROUP BY weapon`);
 	return rows.map((r) => ({
 		weapon: r.weapon,
-		mode: r.mode ?? null,
-		map: r.map ?? null,
 		kills: num(r.kills),
 		headshots: num(r.headshots),
 		players: num(r.players),
@@ -126,8 +117,7 @@ export async function subjectKills(
 		       k.distance_m AS "distanceM", k.headshot, k.team_kill AS "teamKill",
 		       k.killer_faction AS "killerFaction", k.victim_faction AS "victimFaction",
 		       k.victim_steam_id AS "victimSteamId", k.victim_name AS "victimName",
-		       (m.id IS NOT NULL) AS credible,
-		       CASE WHEN m.id IS NOT NULL THEN NULLIF(m.experiences, '') END AS mode
+		       (m.id IS NOT NULL) AS credible
 		  FROM kills k
 		  ${credibleMatch}
 		 WHERE k.killer_steam_id = ${steamId} AND k.server_id IN ${serverIds}
@@ -143,7 +133,6 @@ export async function subjectKills(
 			instanceId: String(r.instanceId ?? ''),
 			matchRow: numOrNull(r.matchRow),
 			credible: r.credible === true || r.credible === 't',
-			mode: (r.mode as string | null) ?? null,
 			eventTime: Number(r.eventTime),
 			map: String(r.map ?? ''),
 			cause: (r.cause as string | null) ?? null,

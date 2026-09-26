@@ -37,6 +37,16 @@ describe('DEFAULT_CONFIG seeding', () => {
 		expect(again).toEqual(DEFAULT_CONFIG);
 	});
 
+	test('there is one cohort definition: a cohort setting is refused (plan R11)', () => {
+		expect('cohort' in DEFAULT_CONFIG.baseline).toBe(false);
+		for (const cohort of ['weapon', 'weapon_mode', 'weapon_mode_map']) {
+			const c = structuredClone(DEFAULT_CONFIG);
+			expect(
+				IntelligenceConfigSchema.safeParse({ ...c, baseline: { ...c.baseline, cohort } }).success
+			).toBe(false);
+		}
+	});
+
 	test('an override for an unscored tag is refused', () => {
 		const c = structuredClone(DEFAULT_CONFIG);
 		c.weaponOverrides['Id.Item.CombatBow'] = { longRange: { enabled: false } };

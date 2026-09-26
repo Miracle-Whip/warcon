@@ -5,7 +5,7 @@ import { assessIntelligence, maxRollingBurst, type Comparison, type Evidence } f
 
 const config = () => ({ ...structuredClone(DEFAULT_CONFIG), enabled: true });
 const row = (): Comparison => ({
-	cohortId: 'M4:modeA',
+	cohortId: 'Id.Item.M4',
 	weapon: 'Id.Item.M4',
 	subject: { kills: 100, headshots: 60 },
 	peers: { kills: 1000, headshots: 200, players: 50 },

@@ -16,23 +16,20 @@ export interface RuleView {
 	requirements: Requirement[];
 }
 
-/** One weapon in one cohort: the subject against every other player in the same cell. */
+/**
+ * One weapon: the subject against every other player with the same exact tag, across every mode
+ * and map (plan R11). The tag is also the cohort id findings and unavailable rules refer to.
+ */
 export interface WeaponRowView {
-	cohortId: string;
 	/** the raw cause tag, exactly as stored */
 	weapon: string;
 	/** weaponInfo(tag).name */
 	name: string;
 	weaponClass: string;
-	/** matches.experiences of the recorded match; null when the cohort ignores mode or it is unknown */
-	mode: string | null;
-	map: string | null;
-	/** false: the cohort needs a mode and this kill's match association was not credible */
-	modeKnown: boolean;
 	subject: Counts;
-	/** every other player in the cell over the baseline window, the subject excluded */
+	/** every other player with this weapon over the baseline window, the subject excluded */
 	peers: Counts & { players: number };
-	/** peers meet the baseline minimums (and the mode is known): counted as matched coverage */
+	/** peers meet the baseline minimums: counted as matched coverage */
 	comparable: boolean;
 	longRange: {
 		enabled: boolean;
@@ -64,7 +61,10 @@ export interface BurstView {
 	rule: Burst | null;
 	/** kills placed on a validated clock segment */
 	used: number;
-	/** kills left out: no credible match, a clock that did not advance, or a bad clock value */
+	/**
+	 * kills left out of the burst only (never the comparisons): no credible match to place them on a
+	 * match clock, a clock that did not advance, or a bad clock value
+	 */
 	excluded: { ambiguousMatch: number; clockNotAdvancing: number; badClock: number };
 	segments: number;
 }
@@ -129,7 +129,6 @@ export interface IntelligenceView {
 		source: 'defaults';
 		revision: number;
 		mode: 'shadow' | 'review';
-		cohort: 'weapon' | 'weapon_mode' | 'weapon_mode_map';
 		requireKnownEnemy: boolean;
 		excludeTeamKills: boolean;
 		minPeerKills: number;
@@ -156,7 +155,7 @@ export interface IntelligenceView {
 		killsOnRecord: number;
 		/** eligible kills in the scoring window, and their headshots */
 		eligible: Counts;
-		/** the same over the matched cells, with the weapon-mix expected share */
+		/** the same over weapons with enough other players, with the weapon-mix expected share */
 		matched: Counts & { expectedPct: number | null; coveragePct: number };
 		/** headshots among long-range kills, over weapons whose long-range rule is on */
 		longRange: Counts;
@@ -171,9 +170,8 @@ export interface IntelligenceView {
 	unscored: UnscoredWeaponView[];
 	coverage: {
 		eligibleKills: number;
+		/** eligible kills on weapons whose peer sample meets the baseline minimums */
 		matchedKills: number;
-		/** eligible kills whose cohort needs a mode the match association could not supply */
-		unknownModeKills: number;
 		knownDistanceKills: number;
 		excluded: { unscored: number; teamKill: number; enemyUnknown: number };
 		/** the subject's rows hit the fetch limit: comparisons are withheld */

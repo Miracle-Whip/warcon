@@ -32,10 +32,10 @@ export const IntelligenceConfigSchema = z
 		enabled: z.boolean(),
 		mode: z.enum(['shadow', 'review']),
 		lookbackDays: integer(1, 90),
+		// One cohort definition (plan R11): the exact weapon tag, across every mode and map.
 		baseline: z
 			.object({
 				lookbackDays: integer(1, 90),
-				cohort: z.enum(['weapon', 'weapon_mode', 'weapon_mode_map']),
 				minPeerKills: integer(10, 1000000),
 				minPeerPlayers: integer(2, 10000),
 				minComparableCoveragePct: integer(0, 100),
@@ -174,7 +174,6 @@ export const DEFAULT_CONFIG: IntelligenceConfig = IntelligenceConfigSchema.parse
 	lookbackDays: 7,
 	baseline: {
 		lookbackDays: 30,
-		cohort: 'weapon_mode',
 		minPeerKills: 500,
 		minPeerPlayers: 30,
 		minComparableCoveragePct: 80,
