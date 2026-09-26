@@ -188,6 +188,11 @@
 					rel="noopener noreferrer"
 					class="text-accent hover:underline">Steam profile ↗</a
 				>{/if}
+			<!-- warcon-intel: player intelligence (docs/intelligence/plan.md) -->
+			{#if can(data.server.caps, 'players.intelligence.read')}<a
+					href="/server/{encodeURIComponent(id)}/players/{d.steamId}/intelligence"
+					class="text-accent hover:underline">Intelligence →</a
+				>{/if}
 			{#if d.names.length > 1}<span
 					>· also seen as {d.names.slice(1, 6).join(', ')}{d.names.length > 6 ? '…' : ''}</span
 				>{/if}
