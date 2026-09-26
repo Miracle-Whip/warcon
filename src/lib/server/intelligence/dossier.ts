@@ -57,7 +57,6 @@ export function fleetKey(c: IntelligenceConfig, serverIds: string[]): string {
 		serverIds: [...new Set(serverIds)].sort(),
 		lookbackDays: c.baseline.lookbackDays,
 		sinceUtc: c.baseline.sinceUtc,
-		cohort: c.baseline.cohort,
 		requireKnownEnemy: c.filters.requireKnownEnemy,
 		excludeTeamKills: c.filters.excludeTeamKills,
 		scored: [...c.filters.scoredWeaponTags].sort(),
@@ -135,7 +134,6 @@ export async function loadIntelligence(
 			source,
 			revision,
 			mode: c.mode,
-			cohort: c.baseline.cohort,
 			requireKnownEnemy: c.filters.requireKnownEnemy,
 			excludeTeamKills: c.filters.excludeTeamKills,
 			minPeerKills: c.baseline.minPeerKills,
@@ -193,7 +191,6 @@ export async function loadIntelligence(
 		coverage: {
 			eligibleKills: a.mix.eligibleKills,
 			matchedKills: a.mix.matched.kills,
-			unknownModeKills: a.mix.unknownModeKills,
 			knownDistanceKills: a.knownDistanceKills,
 			excluded: a.excluded,
 			clipped: subject.clipped

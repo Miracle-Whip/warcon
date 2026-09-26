@@ -8,7 +8,8 @@ export interface Counts {
 	kills: number;
 	headshots: number;
 }
-// One row per weapon + resolved cohort, not one blended row across different modes/maps.
+// One row per weapon, never one blended row across weapons. The cohort is the exact weapon tag
+// across every mode and map (plan R11), so cohortId is that tag.
 export interface Comparison {
 	cohortId: string;
 	weapon: string;

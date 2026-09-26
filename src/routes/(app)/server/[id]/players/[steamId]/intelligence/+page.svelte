@@ -8,9 +8,9 @@
 	import OpponentTable from '$lib/components/intelligence/OpponentTable.svelte';
 	import ReviewPriority from '$lib/components/intelligence/ReviewPriority.svelte';
 	import WeaponTable from '$lib/components/intelligence/WeaponTable.svelte';
-	import { expLabel, fmtAgo, fmtMinutes, fmtNum, fmtTime, mapLabel } from '$lib/format';
+	import { fmtAgo, fmtMinutes, fmtNum, fmtTime, mapLabel } from '$lib/format';
 	import { kdText, pctText } from '$lib/intelligence/format';
-	import type { IntelligenceView, WeaponRowView } from '$lib/intelligence/types';
+	import type { IntelligenceView } from '$lib/intelligence/types';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -31,27 +31,9 @@
 		return `${dossier}/intelligence${s ? `?${s.replace(/%2C/g, ',')}` : ''}`;
 	}
 
-	const modeText = (mode: string | null) =>
-		mode
-			? mode
-					.split('+')
-					.filter(Boolean)
-					.map((e) => expLabel(data.catalog, e))
-					.join(' + ')
-			: '';
-	const cohortText = (r: Pick<WeaponRowView, 'mode' | 'map' | 'modeKnown'>) => {
-		if (v.settings.cohort === 'weapon') return 'all modes';
-		if (!r.modeKnown) return 'mode unknown';
-		const mode = modeText(r.mode);
-		return v.settings.cohort === 'weapon_mode_map' && r.map
-			? `${mode} · ${mapLabel(data.catalog, r.map)}`
-			: mode;
-	};
-	let byCohort = $derived(new Map(v.weapons.map((r) => [r.cohortId, r])));
-	const labelOf = (cohortId: string) => {
-		const r = byCohort.get(cohortId);
-		return r ? `${r.name} (${cohortText(r)})` : cohortId;
-	};
+	// A finding's cohort id is the weapon tag itself (plan R11).
+	let byWeapon = $derived(new Map(v.weapons.map((r) => [r.weapon, r])));
+	const labelOf = (cohortId: string) => byWeapon.get(cohortId)?.name ?? cohortId;
 	let flagged = $derived(
 		new Set(v.assessment.findings.map((f) => `${f.cohortId}|${f.code}`).filter(Boolean))
 	);
@@ -69,11 +51,6 @@
 		burst.excluded.ambiguousMatch + burst.excluded.clockNotAdvancing + burst.excluded.badClock
 	);
 	const PRESENCE_TONE = { online: 'ok', unknown: 'warn', offline: '' } as const;
-	const COHORT: Record<IntelligenceView['settings']['cohort'], string> = {
-		weapon: 'weapon',
-		weapon_mode: 'weapon and mode',
-		weapon_mode_map: 'weapon, mode and map'
-	};
 	const REASON = {
 		catalog: 'not in the weapon catalog yet',
 		class: 'class never scored',
@@ -127,8 +104,9 @@
 	<span class="block text-[12.5px] text-mist-400">
 		Scoring window: the last {v.windows.scoring.days} days. Other players: {fmtTime(
 			v.windows.baseline.from
-		).slice(0, 12)} to {fmtTime(v.windows.baseline.to)}, compared by {COHORT[v.settings.cohort]}.
-		Settings: the built-in defaults, evaluated on demand in shadow mode (nothing is queued).
+		).slice(0, 12)} to {fmtTime(v.windows.baseline.to)}, compared by exact weapon across all modes
+		and maps. Settings: the built-in defaults, evaluated on demand in shadow mode (nothing is
+		queued).
 	</span>
 </div>
 
@@ -152,14 +130,14 @@
 	</div>
 	<div
 		class="panel py-4"
-		title="Headshot kills divided by eligible kills on the matched weapons, against the share other players would have with the same weapon mix. Not shooting accuracy."
+		title="Headshot kills divided by eligible kills on weapons with enough other players to compare, against the share other players would have with the same weapon mix. Not shooting accuracy."
 	>
 		<div class="caps text-mist-400">Headshot share</div>
 		<div class="mt-1 font-display text-2xl font-semibold tabular">{pctText(matchedShare)}</div>
 		<div class="text-[12px] text-mist-600">
 			{#if k.matched.expectedPct !== null}vs {pctText(k.matched.expectedPct)} expected · {pctText(
 					k.matched.coveragePct
-				)} matched{:else}no matched cohort yet{/if}
+				)} of kills compared{:else}no weapon has enough other players yet{/if}
 		</div>
 	</div>
 	<div
@@ -223,11 +201,12 @@
 		<span class="label-sm">Weapons against other players · last {v.windows.scoring.days} days</span>
 		<p class="mb-3 text-[12.5px] text-mist-600">
 			Headshot share is headshot kills divided by eligible kills, not shooting accuracy. Other
-			players are everyone else with the same weapon and cohort on these servers over the baseline
-			window, each counted once however many servers and days they played; this player's own kills
-			are left out. A rule judges a row only once every check in its details is met.
+			players are everyone else with the exact same weapon on these servers over the baseline
+			window, whatever the mode or map, each counted once however many servers and days they played;
+			this player's own kills are left out. A rule judges a row only once every check in its details
+			is met.
 		</p>
-		<WeaponTable rows={v.weapons} {flagged} cohortLabel={cohortText} />
+		<WeaponTable rows={v.weapons} {flagged} />
 		{#if v.unscored.length}
 			<span class="mt-4 field-label">Kills with weapons that are not scored</span>
 			<div class="table-wrap">
@@ -360,14 +339,9 @@
 				>
 			</div>
 			<div class="kv">
-				<span class="text-mist-400">Matched to a comparable cohort</span><span class="tabular"
+				<span class="text-mist-400">On weapons with enough other players</span><span class="tabular"
 					>{fmtNum(v.coverage.matchedKills)} ({pctText(k.matched.coveragePct)}; rules need {v
 						.settings.minComparableCoveragePct}%)</span
-				>
-			</div>
-			<div class="kv">
-				<span class="text-mist-400">Mode unknown (not compared)</span><span class="tabular"
-					>{fmtNum(v.coverage.unknownModeKills)}</span
 				>
 			</div>
 			<div class="kv">
@@ -415,15 +389,15 @@
 				the shot.
 			</li>
 			<li>
-				A kill's mode comes from the recorded match it was attached to, only where that attachment
-				is credible (same server, inside the match's time, same map); otherwise the kill is not
-				compared.
+				Other players are compared by exact weapon only, across every mode and map; a kill counts
+				whether or not it is linked to a recorded match.
 			</li>
 			<li>
 				Bursts are counted on the match clock within one server boot and one recorded match, split
-				wherever the clock and receipt time disagree. Kills without such a segment are left out, so
-				a burst can be undercounted but not invented. The rule needs at least {v.settings.burst
-					.minKills} kills against {v.settings.burst.minDistinctVictims} different victims.
+				wherever the clock and receipt time disagree. Kills without such a segment are left out of
+				the burst (never the comparisons), so a burst can be undercounted but not invented. The rule
+				needs at least {v.settings.burst.minKills} kills against {v.settings.burst
+					.minDistinctVictims} different victims.
 			</li>
 			<li>
 				The recorded K/D is the game's scoreboard over recorded matches; the kill feed covers a

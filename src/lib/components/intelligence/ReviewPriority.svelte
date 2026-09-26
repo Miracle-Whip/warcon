@@ -12,7 +12,7 @@
 	}: {
 		assessment: Assessment;
 		settings: IntelligenceView['settings'];
-		/** a cohort id as people read it: weapon and mode */
+		/** a cohort id (the exact weapon tag) as people read it: the weapon's name */
 		labelOf: (cohortId: string) => string;
 	} = $props();
 
@@ -34,7 +34,7 @@
 		assessment.level ? TONE[assessment.level as keyof typeof TONE] : ''
 	);
 
-	/** "<cohort>: <rule> has insufficient comparable evidence", as people read it */
+	/** "<weapon tag>: <rule> has insufficient comparable evidence", as people read it */
 	let unavailable = $derived(
 		assessment.unavailable.map((u) => {
 			const m = /^(.*): (headshots|longRange) has insufficient comparable evidence$/.exec(u);

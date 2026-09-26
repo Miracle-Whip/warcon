@@ -1,5 +1,6 @@
-// The intelligence page against a real database: the SQL filters and cohorts agree with the pure
-// analysis, the subject leaves the peers, a player on two servers counts once, the scope follows
+// The intelligence page against a real database: the SQL filters and per-weapon totals agree with
+// the pure analysis, the subject leaves the peers, a player on two servers counts once, a kill with
+// no linked match is compared like any other (plan R11), the scope follows
 // the capability, and a stats purge drops the memoised baselines. Skipped without
 // TEST_DATABASE_URL, like the other database suites.
 import { beforeAll, describe, expect, test } from 'bun:test';
@@ -27,6 +28,7 @@ const PEER = '76561198000000702';
 const OTHER = '76561198000000703';
 const M4 = 'Id.Item.M4';
 const MOSIN = 'Id.Item.Mosin';
+const SKS = 'Id.Item.SKS';
 
 describe.skipIf(!hasTestDb)('player intelligence', () => {
 	let env: Env;
@@ -46,8 +48,7 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 				.values({
 					serverId,
 					startedAt: new Date(now - 2 * 3600_000),
-					map: 'Europe',
-					experiences: 'Conquest'
+					map: 'Europe'
 				})
 				.returning({ id: matches.id });
 			return m.id;
@@ -60,8 +61,7 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 				serverId: w.server.id,
 				startedAt: new Date(now - 5 * 3600_000),
 				endedAt: new Date(now - 4 * 3600_000),
-				map: 'Europe',
-				experiences: 'Conquest'
+				map: 'Europe'
 			})
 			.returning({ id: matches.id });
 		await env.db
@@ -105,9 +105,12 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 			k({ killerSteamId: SUBJECT }),
 			k({ killerSteamId: SUBJECT, cause: MOSIN, distanceM: 310, headshot: true }),
 			k({ killerSteamId: SUBJECT, cause: MOSIN, distanceM: 250 }),
-			// a map the open match is not on, and a kill from before the match: no credible mode
+			// a map the open match is not on, and a kill from before the match: compared all the same
 			k({ killerSteamId: SUBJECT, map: 'Dunes' }),
 			k({ killerSteamId: SUBJECT, ts: new Date(now - 3 * 3600_000) }),
+			// the only SKS kills, neither linked to a match: one the subject's, one a peer's
+			k({ killerSteamId: SUBJECT, cause: SKS, matchRow: null }),
+			k({ killerSteamId: PEER, cause: SKS, matchRow: null, headshot: true }),
 			// a team kill and a suicide
 			k({ killerSteamId: SUBJECT, victimFaction: 'A', teamKill: true }),
 			k({ killerSteamId: SUBJECT, victimSteamId: SUBJECT, suicide: true }),
@@ -120,6 +123,7 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 			k({ killerSteamId: OTHER, headshot: true, victimFaction: 'A', teamKill: true }),
 			k({ killerSteamId: OTHER, headshot: true, victimFaction: null }),
 			k({ killerSteamId: OTHER, headshot: true, cause: 'Id.Item.M67Grenade' }),
+			// ...and one they keep, on a map the match is not on: a second M4 peer
 			k({ killerSteamId: OTHER, headshot: true, map: 'Dunes' })
 		]);
 	});
@@ -147,10 +151,12 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 		expect(view!.scope.servers.map((s) => s.id).sort()).toEqual(
 			[w.server.id, w.otherServer.id].sort()
 		);
-		const m4 = view!.weapons.find((r) => r.weapon === M4 && r.modeKnown)!;
-		expect(m4.mode).toBe('Conquest');
-		expect(m4.subject).toEqual({ kills: 3, headshots: 2 });
-		expect(m4.peers).toEqual({ kills: 4, headshots: 1, players: 1 });
+		// one M4 row for every mode and map: the subject's 5 (2 headshots), and 5 others' kills by
+		// PEER (4, on both servers, counted once) and OTHER (1, on another map)
+		const m4 = view!.weapons.filter((r) => r.weapon === M4);
+		expect(m4.length).toBe(1);
+		expect(m4[0].subject).toEqual({ kills: 5, headshots: 2 });
+		expect(m4[0].peers).toEqual({ kills: 5, headshots: 2, players: 2 });
 	});
 
 	test('the long-range cutoff in SQL is the weapon class one, as in the analysis', async () => {
@@ -165,12 +171,19 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 		expect(view!.kpis.longRange).toEqual({ kills: 1, headshots: 1 });
 	});
 
-	test('kills without a credible match are not compared, and exclusions are counted', async () => {
+	test('a kill with no linked match counts toward both the subject and the peer baseline', async () => {
 		const { view } = await read('owner');
-		expect(view!.coverage.unknownModeKills).toBe(2);
+		const sks = view!.weapons.find((r) => r.weapon === SKS)!;
+		expect(sks.subject).toEqual({ kills: 1, headshots: 0 });
+		expect(sks.peers).toEqual({ kills: 1, headshots: 1, players: 1 });
+	});
+
+	test('only the filters leave kills out, and they are counted', async () => {
+		const { view } = await read('owner');
 		expect(view!.coverage.excluded).toEqual({ unscored: 0, teamKill: 1, enemyUnknown: 0 });
-		expect(view!.kpis.killsOnRecord).toBe(8);
-		expect(view!.kpis.eligible.kills).toBe(7);
+		expect(view!.kpis.killsOnRecord).toBe(9);
+		expect(view!.kpis.eligible.kills).toBe(8);
+		expect(view!.coverage.eligibleKills).toBe(8);
 	});
 
 	test('history comes from sessions and recorded matches', async () => {
@@ -189,8 +202,9 @@ describe.skipIf(!hasTestDb)('player intelligence', () => {
 			.where(eq(orgRoles.id, w.roles.admin));
 		const { view } = await read('admin');
 		expect(view!.scope.servers.map((s) => s.id)).toEqual([w.server.id]);
-		const m4 = view!.weapons.find((r) => r.weapon === M4 && r.modeKnown)!;
-		expect(m4.peers).toEqual({ kills: 2, headshots: 1, players: 1 });
+		// this server's M4 kills only: PEER's 2 here (1 headshot) and OTHER's 1
+		const m4 = view!.weapons.find((r) => r.weapon === M4)!;
+		expect(m4.peers).toEqual({ kills: 3, headshots: 2, players: 2 });
 		expect((await read('admin', `servers=${w.otherServer.id}`)).status).toBe(403);
 		expect((await read('owner', `servers=${w.server.id}`)).view!.scope.servers.length).toBe(1);
 	});

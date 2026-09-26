@@ -1,8 +1,8 @@
-// The pure part of a player's intelligence page: which kills are eligible, which cohort cell each
-// belongs to, the subject against every other player in that cell, weapon-mix expectations,
-// validated clock segments for bursts, and the charts' bins. No database: the server hands in
-// the subject's kill rows and the fleet's per-cell totals, and everything here is unit tested.
-// Definitions follow docs/intelligence/plan.md §5.
+// The pure part of a player's intelligence page: which kills are eligible, the subject against
+// every other player on the same exact weapon tag, weapon-mix expectations, validated clock
+// segments for bursts, and the charts' bins. No database: the server hands in the subject's kill
+// rows and the fleet's per-weapon totals, and everything here is unit tested. Definitions follow
+// docs/intelligence/plan.md §5, with R11: one cohort, the weapon tag, across every mode and map.
 import { weaponRules, type IntelligenceConfig } from './config';
 import {
 	assessIntelligence,
@@ -32,10 +32,11 @@ export interface SubjectKill {
 	/** the game's per-boot server id */
 	instanceId: string;
 	matchRow: number | null;
-	/** the match association passed the checks: same server, inside the match's time, same map */
+	/**
+	 * The match association passed the checks (same server, inside the match's time, same map).
+	 * Only burst timing reads it, to place the kill on a match clock; the comparisons never do.
+	 */
 	credible: boolean;
-	/** the recorded match's experiences when the association is credible */
-	mode: string | null;
 	/** seconds on the match clock */
 	eventTime: number;
 	map: string;
@@ -80,33 +81,6 @@ export function longRangeCutoffs(c: IntelligenceConfig): Map<string, number> {
 	return out;
 }
 
-export interface CellKey {
-	weapon: string;
-	mode: string | null;
-	map: string | null;
-	/** false when the cohort needs a mode and the kill's match association could not supply one */
-	modeKnown: boolean;
-}
-
-export const cellId = (weapon: string, mode: string | null, map: string | null): string =>
-	JSON.stringify([weapon, mode, map]);
-
-/** The cohort cell of an eligible kill: raw tag, plus mode and map as the cohort asks. */
-export function cellOf(
-	cohort: IntelligenceConfig['baseline']['cohort'],
-	k: Pick<SubjectKill, 'cause' | 'credible' | 'mode' | 'map'>
-): CellKey {
-	const weapon = k.cause ?? '';
-	if (cohort === 'weapon') return { weapon, mode: null, map: null, modeKnown: true };
-	const mode = k.credible && k.mode ? k.mode : null;
-	return {
-		weapon,
-		mode,
-		map: cohort === 'weapon_mode_map' ? k.map : null,
-		modeKnown: mode !== null
-	};
-}
-
 export interface CellCounts {
 	kills: number;
 	headshots: number;
@@ -115,7 +89,9 @@ export interface CellCounts {
 	lrHeadshots: number;
 	knownDistance: number;
 }
-export interface SubjectCell extends CellKey {
+export interface SubjectCell {
+	/** the exact cause tag, as stored */
+	weapon: string;
 	counts: CellCounts;
 }
 
@@ -127,7 +103,10 @@ const blankCounts = (): CellCounts => ({
 	knownDistance: 0
 });
 
-/** The subject's eligible kills received in [from, to] (ms, inclusive), by cohort cell. */
+/**
+ * The subject's eligible kills received in [from, to] (ms, inclusive), by exact weapon tag. Mode,
+ * map and whether a match is linked play no part (plan R11).
+ */
 export function tallyCells(
 	c: IntelligenceConfig,
 	kills: SubjectKill[],
@@ -138,15 +117,14 @@ export function tallyCells(
 	const out = new Map<string, SubjectCell>();
 	for (const k of kills) {
 		if (k.ts < range.from || k.ts > range.to || excluded(k)) continue;
-		const key = cellOf(c.baseline.cohort, k);
-		const id = cellId(key.weapon, key.mode, key.map);
-		let cell = out.get(id);
-		if (!cell) out.set(id, (cell = { ...key, counts: blankCounts() }));
+		const weapon = k.cause!; // eligible, so a scored tag
+		let cell = out.get(weapon);
+		if (!cell) out.set(weapon, (cell = { weapon, counts: blankCounts() }));
 		cell.counts.kills++;
 		if (k.headshot) cell.counts.headshots++;
 		if (k.distanceM !== null) {
 			cell.counts.knownDistance++;
-			const cutoff = cutoffs.get(key.weapon);
+			const cutoff = cutoffs.get(weapon);
 			if (cutoff !== undefined && k.distanceM >= cutoff) {
 				cell.counts.lrKills++;
 				if (k.headshot) cell.counts.lrHeadshots++;
@@ -156,11 +134,9 @@ export function tallyCells(
 	return out;
 }
 
-/** The fleet's totals for one cell over the baseline window, every player included. */
+/** The fleet's totals for one weapon tag over the baseline window, every player included. */
 export interface FleetCell {
 	weapon: string;
-	mode: string | null;
-	map: string | null;
 	kills: number;
 	headshots: number;
 	/** distinct killers */
@@ -228,7 +204,7 @@ const pctText = (v: number) => `${Math.round(v * 10) / 10}%`;
  */
 export function ruleView(
 	c: IntelligenceConfig,
-	row: Pick<WeaponRowView, 'weapon' | 'modeKnown' | 'subject' | 'peers' | 'longRange'>,
+	row: Pick<WeaponRowView, 'weapon' | 'subject' | 'peers' | 'longRange'>,
 	code: 'headshots' | 'longRange',
 	coveragePct: number | null
 ): RuleView {
@@ -248,12 +224,9 @@ export function ruleView(
 		Number.isFinite(coveragePct) &&
 		coveragePct <= 100 &&
 		coveragePct >= min;
-	const req: Requirement[] = [];
-	if (!row.modeKnown)
-		req.push({ label: 'Recorded match mode', need: 'known', have: 'unknown', ok: false });
-	req.push(
+	const req: Requirement[] = [
 		{
-			label: 'Matched coverage of eligible kills',
+			label: 'Eligible kills on weapons with enough other players',
 			need: `≥ ${min}%`,
 			have: coveragePct === null ? 'withheld (row limit reached)' : pctText(coveragePct),
 			ok: covered
@@ -282,37 +255,31 @@ export function ruleView(
 			have: String(p.headshots),
 			ok: p.headshots > 0
 		}
-	);
+	];
 	if (!validCounts(s) || !validCounts(p))
 		req.push({ label: 'Counts are consistent', need: 'yes', have: 'no', ok: false });
 	return { state: req.every((q) => q.ok) ? 'eligible' : 'unavailable', requirements: req };
 }
 
-/** The weapons table: one row per cell the subject has eligible kills in, most kills first. */
+/** The weapons table: one row per weapon tag the subject has eligible kills with, most kills first. */
 export function weaponRows(
 	c: IntelligenceConfig,
 	subject: Map<string, SubjectCell>,
 	fleet: Map<string, FleetCell>,
 	own: Map<string, SubjectCell>
 ): WeaponRowView[] {
-	const rows = [...subject].map(([id, cell]): WeaponRowView => {
-		const { peers, longRange } = peersExcluding(fleet.get(id), own.get(id)?.counts);
-		const info = weaponInfo(cell.weapon);
-		const lr = weaponRules(c, cell.weapon).longRange;
+	const rows = [...subject].map(([weapon, cell]): WeaponRowView => {
+		const { peers, longRange } = peersExcluding(fleet.get(weapon), own.get(weapon)?.counts);
+		const info = weaponInfo(weapon);
+		const lr = weaponRules(c, weapon).longRange;
 		return {
-			cohortId: id,
-			weapon: cell.weapon,
+			weapon,
 			name: info.name,
 			weaponClass: info.class,
-			mode: cell.mode,
-			map: cell.map,
-			modeKnown: cell.modeKnown,
 			subject: { kills: cell.counts.kills, headshots: cell.counts.headshots },
 			peers,
 			comparable:
-				cell.modeKnown &&
-				peers.kills >= c.baseline.minPeerKills &&
-				peers.players >= c.baseline.minPeerPlayers,
+				peers.kills >= c.baseline.minPeerKills && peers.players >= c.baseline.minPeerPlayers,
 			longRange: {
 				enabled: lr.enabled,
 				distanceM: lr.distanceM,
@@ -328,32 +295,29 @@ export function weaponRows(
 		(a, b) =>
 			b.subject.kills - a.subject.kills ||
 			a.name.localeCompare(b.name) ||
-			(a.cohortId < b.cohortId ? -1 : 1)
+			(a.weapon < b.weapon ? -1 : 1)
 	);
 }
 
 export interface WeaponMix {
 	eligibleKills: number;
+	/** the eligible kills on weapons whose peer sample meets the baseline minimums */
 	matched: Counts;
-	/** eligible kills whose cohort needs a mode that was not known */
-	unknownModeKills: number;
 	/** matched kills as a share of eligible kills, 0 when there are none */
 	coveragePct: number;
 	/**
-	 * Weapon-mix expected headshot share over the matched cells: each cell's kills times its peers'
-	 * share, summed, over the matched kills. Null when no cell matched.
+	 * Weapon-mix expected headshot share over the matched weapons: each weapon's kills times its
+	 * peers' share, summed, over the matched kills. Null when no weapon has enough peers.
 	 */
 	expectedPct: number | null;
 }
 
 export function weaponMix(rows: WeaponRowView[]): WeaponMix {
 	let eligibleKills = 0;
-	let unknownModeKills = 0;
 	const matched = { kills: 0, headshots: 0 };
 	let expected = 0;
 	for (const r of rows) {
 		eligibleKills += r.subject.kills;
-		if (!r.modeKnown) unknownModeKills += r.subject.kills;
 		if (!r.comparable) continue;
 		matched.kills += r.subject.kills;
 		matched.headshots += r.subject.headshots;
@@ -362,23 +326,20 @@ export function weaponMix(rows: WeaponRowView[]): WeaponMix {
 	return {
 		eligibleKills,
 		matched,
-		unknownModeKills,
 		coveragePct: eligibleKills ? (100 * matched.kills) / eligibleKills : 0,
 		expectedPct: matched.kills ? (100 * expected) / matched.kills : null
 	};
 }
 
-/** What assessIntelligence judges: the cells with a known cohort (unknown mode is not compared). */
+/** What assessIntelligence judges: every weapon row, its cohort id being the weapon tag itself. */
 export const comparisonsFrom = (rows: WeaponRowView[]): Comparison[] =>
-	rows
-		.filter((r) => r.modeKnown)
-		.map((r) => ({
-			cohortId: r.cohortId,
-			weapon: r.weapon,
-			subject: r.subject,
-			peers: r.peers,
-			longRange: { subject: r.longRange.subject, peers: r.longRange.peers }
-		}));
+	rows.map((r) => ({
+		cohortId: r.weapon,
+		weapon: r.weapon,
+		subject: r.subject,
+		peers: r.peers,
+		longRange: { subject: r.longRange.subject, peers: r.longRange.peers }
+	}));
 
 // ---- bursts -----------------------------------------------------------------------------------
 
@@ -406,8 +367,8 @@ export interface ClockSegments {
  * Places kills on validated match-clock segments. A segment is one server boot (instance) and one
  * recorded match with a credible association, split wherever receipt time and the match clock
  * disagree by more than the tolerance (a reset, or a batch held back), and dropped whole when its
- * clock does not advance with receipt time. Kills without a credible match are left out, never
- * guessed onto a neighbour.
+ * clock does not advance with receipt time. Kills without a credible match are left out of the
+ * burst, never guessed onto a neighbour's clock; they still count in every comparison.
  */
 export function clockSegments(kills: ClockKill[], tolerance = CLOCK_TOLERANCE_S): ClockSegments {
 	const excluded = { ambiguousMatch: 0, clockNotAdvancing: 0, badClock: 0 };
@@ -687,7 +648,7 @@ export function analyse(input: AnalysisInput): Analysis {
 	const inScoring = kills.filter((k) => k.ts >= scoring.from && k.ts <= scoring.to);
 	const eligibleNow = inScoring.filter((k) => !excluded(k));
 
-	const fleetCells = new Map(fleet.cells.map((f) => [cellId(f.weapon, f.mode, f.map), f]));
+	const fleetCells = new Map(fleet.cells.map((f) => [f.weapon, f]));
 	const own = tallyCells(c, kills, { from: fleet.from, to: fleet.asOf });
 	const rows = weaponRows(c, tallyCells(c, kills, scoring), fleetCells, own);
 	const mix = weaponMix(rows);

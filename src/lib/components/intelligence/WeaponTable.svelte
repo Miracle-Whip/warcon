@@ -1,6 +1,7 @@
 <script lang="ts">
-	// The subject against every other player, per weapon and cohort, with the sample-size gates
-	// spelled out. A row expands to the checks each rule made and what the data had.
+	// The subject against every other player, per exact weapon tag across every mode and map, with
+	// the sample-size gates spelled out. A row expands to the checks each rule made and what the
+	// data had.
 	import Badge from '$lib/components/Badge.svelte';
 	import { fmtNum } from '$lib/format';
 	import { pctText, shareText } from '$lib/intelligence/format';
@@ -8,13 +9,11 @@
 
 	let {
 		rows,
-		flagged,
-		cohortLabel
+		flagged
 	}: {
 		rows: WeaponRowView[];
-		/** `${cohortId}|${rule}` of every finding */
+		/** `${weapon}|${rule}` of every finding */
 		flagged: Set<string>;
-		cohortLabel: (row: WeaponRowView) => string;
 	} = $props();
 
 	let open = $state<Record<string, boolean>>({});
@@ -68,7 +67,6 @@
 		<thead>
 			<tr>
 				<th>Weapon</th>
-				<th>Cohort</th>
 				<th class="num">Kills</th>
 				<th class="num">Headshot share</th>
 				<th class="num">Other players</th>
@@ -81,7 +79,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each rows as r (r.cohortId)}
+			{#each rows as r (r.weapon)}
 				<tr>
 					<td>
 						<span title={r.weapon}>{r.name}</span>
@@ -89,15 +87,14 @@
 								>{CLASS[r.weaponClass]}</span
 							>{/if}
 					</td>
-					<td class="text-mist-400">{cohortLabel(r)}</td>
 					<td class="num">{fmtNum(r.subject.kills)}</td>
 					<td class="num">{shareText(r.subject)}</td>
 					<td class="num">
-						{#if r.modeKnown}{shareText(r.peers)}<span class="block text-[11.5px] text-mist-600"
-								>{fmtNum(r.peers.players)} player{r.peers.players === 1 ? '' : 's'}</span
-							>{:else}—{/if}
+						{shareText(r.peers)}<span class="block text-[11.5px] text-mist-600"
+							>{fmtNum(r.peers.players)} player{r.peers.players === 1 ? '' : 's'}</span
+						>
 					</td>
-					<td class="num">{r.modeKnown ? ratio(r) : '—'}</td>
+					<td class="num">{ratio(r)}</td>
 					<td class="num">{r.longRange.enabled ? `≥ ${r.longRange.distanceM} m` : 'off'}</td>
 					<td class="num">
 						{r.longRange.enabled
@@ -105,7 +102,7 @@
 							: '—'}
 					</td>
 					<td class="num">
-						{#if r.longRange.enabled && r.modeKnown}{shareText(r.longRange.peers)}<span
+						{#if r.longRange.enabled}{shareText(r.longRange.peers)}<span
 								class="block text-[11.5px] text-mist-600"
 								>{fmtNum(r.longRange.peers.players)} player{r.longRange.peers.players === 1
 									? ''
@@ -113,30 +110,26 @@
 							>{:else}—{/if}
 					</td>
 					<td class="whitespace-nowrap">
-						{@render ruleChip(
-							r.headshots,
-							flagged.has(`${r.cohortId}|headshots`),
-							'Headshot share'
-						)}
+						{@render ruleChip(r.headshots, flagged.has(`${r.weapon}|headshots`), 'Headshot share')}
 						{@render ruleChip(
 							r.longRangeRule,
-							flagged.has(`${r.cohortId}|longRange`),
+							flagged.has(`${r.weapon}|longRange`),
 							'Long-range headshots'
 						)}
 					</td>
 					<td>
 						<button
 							class="btn btn-sm btn-ghost"
-							aria-expanded={!!open[r.cohortId]}
+							aria-expanded={!!open[r.weapon]}
 							aria-label="Checks for {r.name}"
-							onclick={() => (open[r.cohortId] = !open[r.cohortId])}
-							>{open[r.cohortId] ? '▾' : '▸'}</button
+							onclick={() => (open[r.weapon] = !open[r.weapon])}
+							>{open[r.weapon] ? '▾' : '▸'}</button
 						>
 					</td>
 				</tr>
-				{#if open[r.cohortId]}
+				{#if open[r.weapon]}
 					<tr>
-						<td colspan="11" class="bg-ink-900 text-[12.5px]">
+						<td colspan="10" class="bg-ink-900 text-[12.5px]">
 							<div class="grid gap-4 py-1 md:grid-cols-2">
 								{@render checks('Headshot share', r.headshots)}
 								{@render checks(
@@ -147,7 +140,7 @@
 								)}
 							</div>
 							<p class="mt-2 text-mist-600">
-								{fmtNum(r.knownDistance)} of {fmtNum(r.subject.kills)} kills have a known distance{#if r.modeKnown && r.peers.kills};
+								{fmtNum(r.knownDistance)} of {fmtNum(r.subject.kills)} kills have a known distance{#if r.peers.kills};
 									other players' share is {pctText((100 * r.peers.headshots) / r.peers.kills)}{/if}.
 								Raw tag <span class="font-mono">{r.weapon}</span>.
 							</p>
@@ -156,7 +149,7 @@
 				{/if}
 			{:else}
 				<tr>
-					<td colspan="11" class="py-6 text-center text-mist-600">
+					<td colspan="10" class="py-6 text-center text-mist-600">
 						No eligible kills in the scoring window.
 					</td>
 				</tr>

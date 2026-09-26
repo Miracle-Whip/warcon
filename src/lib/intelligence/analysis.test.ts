@@ -2,8 +2,6 @@ import { describe, expect, test } from 'bun:test';
 import {
 	analyse,
 	burstView,
-	cellId,
-	cellOf,
 	clockSegments,
 	comparisonsFrom,
 	dayKey,
@@ -45,7 +43,6 @@ const kill = (over: Partial<SubjectKill> = {}): SubjectKill => ({
 	instanceId: 'i1',
 	matchRow: 1,
 	credible: true,
-	mode: 'Conquest',
 	eventTime: 100,
 	map: 'Europe',
 	cause: M4,
@@ -102,23 +99,20 @@ describe('eligibility', () => {
 	});
 });
 
-describe('cohort cells', () => {
-	test('weapon ignores mode and map; weapon_mode needs a credible match', () => {
-		expect(cellOf('weapon', kill({ credible: false }))).toEqual({
-			weapon: M4,
-			mode: null,
-			map: null,
-			modeKnown: true
-		});
-		expect(cellOf('weapon_mode', kill())).toEqual({
-			weapon: M4,
-			mode: 'Conquest',
-			map: null,
-			modeKnown: true
-		});
-		expect(cellOf('weapon_mode', kill({ credible: false })).modeKnown).toBe(false);
-		expect(cellOf('weapon_mode', kill({ mode: null })).modeKnown).toBe(false);
-		expect(cellOf('weapon_mode_map', kill()).map).toBe('Europe');
+describe('one cohort: the exact weapon tag', () => {
+	test('maps, servers and whether a match is linked never split a weapon', () => {
+		const cells = tallyCells(
+			config(),
+			[
+				kill({ headshot: true }),
+				kill({ map: 'Dunes', serverId: 's2' }),
+				kill({ matchRow: null, credible: false }),
+				kill({ credible: false })
+			],
+			{ from: T0, to: T0 }
+		);
+		expect([...cells.keys()]).toEqual([M4]);
+		expect(cells.get(M4)!.counts).toMatchObject({ kills: 4, headshots: 1 });
 	});
 
 	test('long range uses each weapon class cutoff, and an unknown distance is never long range', () => {
@@ -135,15 +129,15 @@ describe('cohort cells', () => {
 			],
 			{ from: T0, to: T0 }
 		);
-		expect(cells.get(cellId(M4, 'Conquest', null))!.counts).toEqual({
+		expect(cells.get(M4)!.counts).toEqual({
 			kills: 3,
 			headshots: 1,
 			lrKills: 1,
 			lrHeadshots: 1,
 			knownDistance: 2
 		});
-		expect(cells.get(cellId(MOSIN, 'Conquest', null))!.counts.lrKills).toBe(1);
-		expect(cells.get(cellId(VECTOR, 'Conquest', null))!.counts.lrKills).toBe(0);
+		expect(cells.get(MOSIN)!.counts.lrKills).toBe(1);
+		expect(cells.get(VECTOR)!.counts.lrKills).toBe(0);
 	});
 
 	test('the window is inclusive at both ends and nothing outside it counts', () => {
@@ -152,15 +146,13 @@ describe('cohort cells', () => {
 			[kill({ ts: T0 - 1 }), kill({ ts: T0 }), kill({ ts: T0 + 10 }), kill({ ts: T0 + 11 })],
 			{ from: T0, to: T0 + 10 }
 		);
-		expect(cells.get(cellId(M4, 'Conquest', null))!.counts.kills).toBe(2);
+		expect(cells.get(M4)!.counts.kills).toBe(2);
 	});
 });
 
 describe('self-exclusion', () => {
 	const fleet: FleetCell = {
 		weapon: M4,
-		mode: 'Conquest',
-		map: null,
 		kills: 1100,
 		headshots: 260,
 		players: 51,
@@ -206,28 +198,17 @@ describe('self-exclusion', () => {
 	});
 });
 
-const subjectCell = (
-	weapon: string,
-	mode: string | null,
-	kills: number,
-	headshots: number
-): SubjectCell => ({
+const subjectCell = (weapon: string, kills: number, headshots: number): SubjectCell => ({
 	weapon,
-	mode,
-	map: null,
-	modeKnown: mode !== null,
 	counts: { kills, headshots, lrKills: 0, lrHeadshots: 0, knownDistance: kills }
 });
 const fleetCell = (
 	weapon: string,
-	mode: string | null,
 	kills: number,
 	headshots: number,
 	players: number
 ): FleetCell => ({
 	weapon,
-	mode,
-	map: null,
 	kills,
 	headshots,
 	players,
@@ -235,50 +216,49 @@ const fleetCell = (
 	lrHeadshots: 0,
 	lrPlayers: 0
 });
-const byId = <T extends { weapon: string; mode: string | null; map: string | null }>(list: T[]) =>
-	new Map(list.map((x) => [cellId(x.weapon, x.mode, x.map), x]));
+const byWeapon = <T extends { weapon: string }>(list: T[]) =>
+	new Map(list.map((x) => [x.weapon, x]));
 
 describe('weapon-mix expectation and coverage', () => {
 	const c = config();
 	const rows = weaponRows(
 		c,
-		byId([
-			subjectCell(M4, 'Conquest', 100, 30),
-			subjectCell(MOSIN, 'Conquest', 50, 30),
-			subjectCell(SKS, 'Conquest', 20, 5),
-			subjectCell(M4, null, 30, 20)
+		byWeapon([
+			subjectCell(M4, 100, 30),
+			subjectCell(MOSIN, 50, 30),
+			subjectCell(SKS, 20, 5),
+			subjectCell(VECTOR, 30, 20)
 		]),
-		byId([
-			fleetCell(M4, 'Conquest', 1000, 200, 40),
-			fleetCell(MOSIN, 'Conquest', 600, 300, 35),
-			fleetCell(SKS, 'Conquest', 100, 20, 10)
+		byWeapon([
+			fleetCell(M4, 1000, 200, 40),
+			fleetCell(MOSIN, 600, 300, 35),
+			fleetCell(SKS, 100, 20, 10),
+			fleetCell(VECTOR, 900, 150, 5)
 		]),
 		new Map()
 	);
 
-	test('each cell is weighted by its own peers, never a pooled rate', () => {
+	test('each weapon is weighted by its own peers, never a pooled rate', () => {
 		const mix = weaponMix(rows);
 		expect(mix.eligibleKills).toBe(200);
 		expect(mix.matched).toEqual({ kills: 150, headshots: 60 });
 		// (100 × 20% + 50 × 50%) / 150; a pooled peer rate (500/1600 = 31.25%) would be wrong
 		expect(mix.expectedPct).toBeCloseTo(30, 10);
 		expect(mix.coveragePct).toBe(75);
-		expect(mix.unknownModeKills).toBe(30);
 	});
 
-	test('a sparse cohort and an unknown mode are not matched, and unknown mode is not compared', () => {
-		const sks = rows.find((r) => r.weapon === SKS)!;
-		expect(sks.comparable).toBe(false);
-		const unknown = rows.find((r) => !r.modeKnown)!;
-		expect(unknown.comparable).toBe(false);
-		expect(comparisonsFrom(rows).map((r) => r.cohortId)).not.toContain(unknown.cohortId);
-		expect(ruleView(c, unknown, 'headshots', 100).requirements[0]).toMatchObject({
-			label: 'Recorded match mode',
-			ok: false
-		});
+	test('too few other kills or other players leaves a weapon out of the matched coverage', () => {
+		expect(rows.find((r) => r.weapon === SKS)!.comparable).toBe(false);
+		expect(rows.find((r) => r.weapon === VECTOR)!.comparable).toBe(false);
 	});
 
-	test('no matched cell means no expectation, and no eligible kills means zero coverage', () => {
+	test('every weapon goes to the score, its cohort id being the tag', () => {
+		expect(comparisonsFrom(rows).map((r) => [r.cohortId, r.weapon])).toEqual(
+			[M4, MOSIN, VECTOR, SKS].map((w) => [w, w])
+		);
+	});
+
+	test('no matched weapon means no expectation, and no eligible kills means zero coverage', () => {
 		expect(weaponMix([])).toMatchObject({ coveragePct: 0, expectedPct: null });
 	});
 });
@@ -290,13 +270,9 @@ describe('the explanation agrees with the score', () => {
 		s: [number, number],
 		p: [number, number, number]
 	): WeaponRowView => ({
-		cohortId: cellId(weapon, 'Conquest', null),
 		weapon,
 		name: weapon,
 		weaponClass: '',
-		mode: 'Conquest',
-		map: null,
-		modeKnown: true,
 		subject: { kills: s[0], headshots: s[1] },
 		peers: { kills: p[0], headshots: p[1], players: p[2] },
 		comparable: true,
@@ -327,7 +303,7 @@ describe('the explanation agrees with the score', () => {
 								});
 								for (const code of ['headshots', 'longRange'] as const) {
 									const inScore = a.unavailable.includes(
-										`${row.cohortId}: ${code} has insufficient comparable evidence`
+										`${row.weapon}: ${code} has insufficient comparable evidence`
 									);
 									const explained = ruleView(c, row, code, coverage).state;
 									expect({ weapon, sk, pk, ph, pp, coverage, code, inScore }).toEqual({
@@ -554,7 +530,7 @@ describe('analyse', () => {
 			clipped
 		});
 	// the fleet includes the subject: 2000 other kills (400 headshots) by 60 other players
-	const m4Fleet = fleetCell(M4, 'Conquest', 2120, 490, 61);
+	const m4Fleet = fleetCell(M4, 2120, 490, 61);
 
 	test('a strong headshot share on well-covered weapons is a finding', () => {
 		const a = run(m4(), [m4Fleet]);
@@ -573,14 +549,14 @@ describe('analyse', () => {
 		const row = a.weapons.find((r) => r.weapon === M4)!;
 		expect(row.headshots.state).toBe('unavailable');
 		expect(row.headshots.requirements.find((q) => !q.ok)!.label).toBe(
-			'Matched coverage of eligible kills'
+			'Eligible kills on weapons with enough other players'
 		);
 		expect(a.assessment.findings.filter((f) => f.group === 'aim')).toEqual([]);
 	});
 
-	test('without self-exclusion the cohort would pass; with it the sample is too small', () => {
+	test('without self-exclusion the weapon sample would pass; with it the sample is too small', () => {
 		// 499 other kills by 29 other players: the subject's 120 kills must not lift them over 500 / 30
-		const a = run(m4(), [fleetCell(M4, 'Conquest', 619, 190, 30)]);
+		const a = run(m4(), [fleetCell(M4, 619, 190, 30)]);
 		const q = a.weapons[0].headshots.requirements;
 		expect(q.find((r) => r.label === "Other players' kills")).toMatchObject({
 			have: '499',
@@ -616,5 +592,19 @@ describe('analyse', () => {
 		// the timeline covers the history window, so the older kill is on it too
 		expect(a.timeline.reduce((n, d) => n + d.kills, 0)).toBe(14);
 		expect(a.burst.used).toBe(10);
+	});
+
+	test('a kill with no linked match counts for the subject and in the self-exclusion', () => {
+		// 60 of the 120 kills have no linked match; the fleet holds all 120 of them plus 2000 others
+		const kills = m4().map((k, i) => (i % 2 ? { ...k, matchRow: null, credible: false } : k));
+		const a = run(kills, [m4Fleet]);
+		const row = a.weapons[0];
+		expect(row.subject).toEqual({ kills: 120, headshots: 90 });
+		expect(row.peers).toEqual({ kills: 2000, headshots: 400, players: 60 });
+		expect(a.mix.coveragePct).toBe(100);
+		expect(a.assessment.findings.map((f) => f.code)).toContain('headshots');
+		// only the burst leaves them out: they cannot be placed on a match clock
+		expect(a.burst.used).toBe(60);
+		expect(a.burst.excluded.ambiguousMatch).toBe(60);
 	});
 });
