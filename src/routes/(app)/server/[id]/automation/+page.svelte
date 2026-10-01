@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { invalidateAll } from '$app/navigation';
 	import { api, errorMessage } from '$lib/api';
+	import { MAX_CHAT } from '$lib/chat';
 	import { fmtAgo, fmtSpan, fmtTime, mapLabel } from '$lib/format';
 	import { can } from '$lib/capabilities';
+	import { causeKind, causeLabel, knownCauses, TEAM_KILL_NOT_COUNTED } from '$lib/causes';
 	import { isSteamId } from '$lib/steam-profiles';
 	import { toast } from '$lib/toast.svelte';
 	import { confirmDialog } from '$lib/confirm.svelte';
@@ -174,6 +176,18 @@
 			blurb: 'Flag players who get kills too fast, or too many headshots, for staff to check.'
 		},
 		{
+			kind: 'kill_distance',
+			group: 'Players',
+			label: 'Kill distance watch',
+			blurb: 'Flag, kick or ban players who kill with a weapon from further than it reaches.'
+		},
+		{
+			kind: 'two_teams',
+			group: 'Players',
+			label: 'Two-team mode',
+			blurb: 'Close one faction and move its players to the smaller of the other two.'
+		},
+		{
 			kind: 'seed_reward',
 			group: 'Players',
 			label: 'Seeding reward',
@@ -189,7 +203,11 @@
 	const GROUPS: Group[] = ['Messages', 'Players', 'Server'];
 	/** The outbox action as the table shows it: a flag sends nothing to the game, so it reads as one. */
 	const actionLabel = (action: string) =>
-		action === 'name_flag' || action === 'kill_rate_flag' ? 'flag' : action;
+		action === 'name_flag' || action === 'kill_rate_flag' || action === 'kill_distance_flag'
+			? 'flag'
+			: action === 'panel_ban'
+				? 'ban'
+				: action;
 	const label = (kind: TriggerKind) => KINDS.find((k) => k.kind === kind)?.label ?? kind;
 	const blurb = (kind: TriggerKind) => KINDS.find((k) => k.kind === kind)?.blurb ?? '';
 	/** Why a kind cannot run on this server yet, or '' when it can. */
@@ -197,6 +215,7 @@
 		switch (kind) {
 			case 'team_kill':
 			case 'kill_rate':
+			case 'kill_distance':
 				return data.feed
 					? ''
 					: 'Needs the kill feed, which is off on this server. Turn it on under Config.';
@@ -218,9 +237,39 @@
 	 */
 	let canSlotHere = $derived(can(data.server.caps, 'slots.manage'));
 	let canSlotOrg = $derived(can(data.server.caps, 'lists.reserve'));
+	/**
+	 * what a Kill distance rule may do: flag or kick (Kick, kill, move), ban on this server's list
+	 * (Bans) or the org's (Org ban list)
+	 */
+	let canModerate = $derived(can(data.server.caps, 'players.moderate'));
+	let canBanHere = $derived(can(data.server.caps, 'bans.manage'));
+	let canBanOrg = $derived(can(data.server.caps, 'lists.ban'));
+	/** Charges that are placed and set off from anywhere: how far away the killer was says nothing. */
+	const PLACED = new Set([
+		'id.item.atmine',
+		'id.item.claymore',
+		'id.item.c4explosive',
+		'id.item.ied.explosive'
+	]);
+	/** A rule's cause choices: the causes the panel names that `offer` keeps, and any the rule holds. */
+	const causeChoices = (offer: (cause: string) => boolean, chosen: string[]) => {
+		const out = new Map<string, { cause: string; label: string }>();
+		for (const c of knownCauses()) if (offer(c.cause)) out.set(c.cause.toLowerCase(), c);
+		for (const c of chosen)
+			if (!out.has(c.toLowerCase())) out.set(c.toLowerCase(), { cause: c, label: causeLabel(c) });
+		return [...out.values()].sort((a, b) => a.label.localeCompare(b.label));
+	};
+	/** The weapons a Kill distance rule can watch: the hand-held ones but placed charges. */
+	const weaponChoices = (chosen: string[]) =>
+		causeChoices((c) => causeKind(c) === 'weapon' && !PLACED.has(c.toLowerCase()), chosen);
+	/** What a Team kill limit can leave out of its count: things placed that a teammate runs into. */
+	const notCountedChoices = (chosen: string[]) =>
+		causeChoices((c) => causeKind(c) === 'buildable' || PLACED.has(c.toLowerCase()), chosen);
+	const holds = (list: string[], cause: string) =>
+		list.some((c) => c.toLowerCase() === cause.toLowerCase());
 	/** A kind that lacks what it needs stays in the menu, greyed, with the reason in a few words. */
 	const short = (kind: TriggerKind): string =>
-		kind === 'team_kill' || kind === 'kill_rate'
+		kind === 'team_kill' || kind === 'kill_rate' || kind === 'kill_distance'
 			? 'needs the kill feed'
 			: kind === 'risk_kick'
 				? 'needs a Steam key'
@@ -325,6 +374,7 @@
 		warnMessage: string;
 		kickAt: number;
 		kickReason: string;
+		notCounted: string[];
 		lowAt: number;
 		untilFull: boolean;
 		fullAt: number | null;
@@ -344,7 +394,17 @@
 		maxKills: number;
 		headshotPct: number;
 		headshotMinKills: number;
+		closedFaction: string;
+		teamNames: Record<string, string>;
+		causes: string[];
+		minDistanceM: number;
+		count: number;
+		distanceAction: 'flag' | 'kick' | 'ban';
+		banDays: number;
+		banScope: 'server' | 'org';
 	}
+	/** WARDOGS' factions, offered for Two-team mode; a name the game adds later can still be typed. */
+	const FACTIONS = ['Lonestar', 'Valkyra', 'Manticore'];
 	/** The alphabets a Latin policy can let in, by the name the rule stores and the one people use. */
 	const SCRIPTS: [string, string][] = [
 		['Cyrillic', 'Cyrillic'],
@@ -414,7 +474,9 @@
 						? 'Scheduled restart: the server restarts when this round ends. Rejoin in a minute or two.'
 						: kind === 'seed_reward'
 							? 'Thanks for seeding {server}, {name}: you have a reserved slot until {until}.'
-							: 'Welcome to {server}, {name}! Read the rules with /rules.'
+							: kind === 'two_teams'
+								? 'This server plays two teams: you have been placed on {team}.'
+								: 'Welcome to {server}, {name}! Read the rules with /rules.'
 			),
 			onlyFirstVisit: b('onlyFirstVisit', false),
 			afterFaction: b('afterFaction', false),
@@ -443,7 +505,9 @@
 					? 'Your name is not allowed on this server: {why}.'
 					: kind === 'ping_kick'
 						? 'Ping too high for too long.'
-						: 'Your account does not meet this server’s requirements.'
+						: kind === 'kill_distance'
+							? 'Impossible kill: {weapon} from {distance} m.'
+							: 'Your account does not meet this server’s requirements.'
 			),
 			leadMinutes: n('leadMinutes', 30),
 			leadMessage: s(
@@ -454,12 +518,12 @@
 			endMessage: s('endMessage', 'Match over: {faction} wins on {previous} · {scores}'),
 			startMessage: s('startMessage', 'New match on {map}. Good luck!'),
 			warnAt: n('warnAt', 2),
-			warnMessage: s(
-				'warnMessage',
-				'Careful, {name}: that was a team kill ({count} this session).'
-			),
+			warnMessage: s('warnMessage', 'Careful, {name}: that was a team kill ({count} this match).'),
 			kickAt: n('kickAt', 4),
-			kickReason: s('kickReason', 'Team killing ({count} this session).'),
+			kickReason: s('kickReason', 'Team killing ({count} this match).'),
+			notCounted: Array.isArray(c.notCounted)
+				? [...(c.notCounted as string[])]
+				: [...TEAM_KILL_NOT_COUNTED],
 			lowAt: n('lowAt', 20),
 			untilFull: b('untilFull', true),
 			fullAt: typeof c.fullAt === 'number' ? c.fullAt : null,
@@ -479,7 +543,25 @@
 			windowMinutes: n('windowMinutes', 5),
 			maxKills: n('maxKills', 25),
 			headshotPct: n('headshotPct', 70),
-			headshotMinKills: n('headshotMinKills', 15)
+			headshotMinKills: n('headshotMinKills', 15),
+			closedFaction: s('closedFaction', 'Lonestar'),
+			teamNames:
+				c.names && typeof c.names === 'object' ? { ...(c.names as Record<string, string>) } : {},
+			causes: Array.isArray(c.causes)
+				? [...(c.causes as string[])]
+				: ['Id.Item.Defibrillator.Standard'],
+			minDistanceM: n('minDistanceM', 100),
+			count: n('count', 2),
+			// a new rule kicks, or bans for an author who may ban but not kick
+			distanceAction:
+				c.action === 'flag' || c.action === 'kick' || c.action === 'ban'
+					? c.action
+					: canModerate || (!canBanHere && !canBanOrg)
+						? 'kick'
+						: 'ban',
+			banDays: n('banDays', 0),
+			// a new rule bans where its author may: this server's list first
+			banScope: c.banScope === 'org' ? 'org' : t || canBanHere || !canBanOrg ? 'server' : 'org'
 		};
 		dry = null;
 		pendingSel =
@@ -581,7 +663,8 @@
 					warnAt: Number(f.warnAt),
 					warnMessage: f.warnMessage,
 					kickAt: Number(f.kickAt),
-					kickReason: f.kickReason
+					kickReason: f.kickReason,
+					notCounted: f.notCounted
 				};
 			case 'kill_rate':
 				return {
@@ -590,6 +673,27 @@
 					headshotPct: Number(f.headshotPct),
 					headshotMinKills: Number(f.headshotMinKills),
 					cooldownMinutes: Number(f.cooldownMinutes)
+				};
+			case 'kill_distance':
+				return {
+					causes: f.causes,
+					minDistanceM: Number(f.minDistanceM),
+					count: Number(f.count),
+					action: f.distanceAction,
+					banDays: Number(f.banDays),
+					banScope: f.banScope,
+					reason: f.reason,
+					cooldownMinutes: Number(f.cooldownMinutes)
+				};
+			case 'two_teams':
+				return {
+					closedFaction: f.closedFaction.trim(),
+					names: Object.fromEntries(
+						Object.entries(f.teamNames).filter(
+							([k, v]) => k !== f.closedFaction.trim() && v?.trim()
+						)
+					),
+					message: f.message
 				};
 			case 'seed_reward':
 				return {
@@ -739,14 +843,23 @@
 					.filter(Boolean)
 					.join(' · ')
 					.concat(` · at least ${c.minPlayers} on`);
-			case 'team_kill':
+			case 'team_kill': {
+				const left = Array.isArray(c.notCounted)
+					? (c.notCounted as string[])
+					: TEAM_KILL_NOT_COUNTED;
 				return [
 					c.warnAt ? `whisper from ${c.warnAt} team kill${c.warnAt === 1 ? '' : 's'}` : '',
-					c.kickAt ? `kick at ${c.kickAt}` : ''
+					c.kickAt ? `kick at ${c.kickAt}` : '',
+					'per match',
+					left.length > 3
+						? `${left.length} causes not counted`
+						: left.length
+							? `${left.map((x) => causeLabel(x)).join(', ')} not counted`
+							: ''
 				]
 					.filter(Boolean)
-					.join(' · ')
-					.concat(' · per session');
+					.join(' · ');
+			}
 			case 'kill_rate':
 				return [
 					c.maxKills ? `${c.maxKills} kills` : '',
@@ -755,6 +868,33 @@
 					.filter(Boolean)
 					.join(' or ')
 					.concat(` in ${c.windowMinutes} min · flag only · again after ${c.cooldownMinutes} min`);
+			case 'kill_distance': {
+				const causes = (c.causes as string[] | undefined) ?? [];
+				const weapons =
+					causes.length > 3
+						? `${causes.length} weapons`
+						: causes.map((x) => causeLabel(x)).join(', ') || 'no weapon';
+				const days = Number(c.banDays);
+				const act =
+					c.action === 'ban'
+						? `ban ${c.banScope === 'org' ? 'on every server' : 'here'} ${days ? `for ${days} day${days === 1 ? '' : 's'}` : 'for good'}`
+						: c.action === 'kick'
+							? 'kick'
+							: `flag · again after ${c.cooldownMinutes} min`;
+				return `${weapons} from ${c.minDistanceM} m · ${c.count === 1 ? '1 kill' : `${c.count} kills in a match`} · ${act}`;
+			}
+			case 'two_teams': {
+				const names = Object.entries((c.names as Record<string, string> | undefined) ?? {}).map(
+					([k, v]) => `${k} as ${v}`
+				);
+				return [
+					`${c.closedFaction} closed, its players moved to the smaller side`,
+					names.length ? names.join(', ') : '',
+					c.message ? 'with a whisper' : ''
+				]
+					.filter(Boolean)
+					.join(' · ');
+			}
 			case 'seed_reward':
 				return `${c.minutes} min with ${c.lowAt} or fewer on${c.untilFull === false ? '' : `, staying until ${typeof c.fullAt === 'number' ? `${c.fullAt}+ on` : 'it fills'}`}, within ${c.windowDays} day${c.windowDays === 1 ? '' : 's'} · slot ${c.scope === 'server' ? 'here' : 'on every server'} for ${c.slotDays} day${c.slotDays === 1 ? '' : 's'}${c.message ? ' · with a whisper' : ''}`;
 		}
@@ -1081,7 +1221,7 @@
 				{#if f.kind === 'welcome'}
 					<fieldset class="space-y-2">
 						<legend class="field-label">Whisper</legend>
-						<input class="input" type="text" bind:value={f.message} maxlength="200" required />
+						<input class="input" type="text" bind:value={f.message} maxlength={MAX_CHAT} required />
 						{@render placeholders(['name', 'faction', 'server', 'map', 'players', 'max'])}
 					</fieldset>
 					<fieldset class="space-y-1.5 text-[13px]">
@@ -1099,7 +1239,7 @@
 				{:else if f.kind === 'faction_change'}
 					<fieldset class="space-y-2">
 						<legend class="field-label">Whisper</legend>
-						<input class="input" type="text" bind:value={f.message} maxlength="200" required />
+						<input class="input" type="text" bind:value={f.message} maxlength={MAX_CHAT} required />
 						{@render placeholders([
 							'name',
 							'faction',
@@ -1157,7 +1297,7 @@
 					</fieldset>
 					<p class="note">
 						Blank for no ceiling; a fill-the-server message can stop once it has. Broadcasts are
-						limited to 200 characters.
+						limited to {MAX_CHAT} characters.
 					</p>
 				{:else if f.kind === 'empty_reset'}
 					<fieldset class="space-y-2">
@@ -1213,7 +1353,7 @@
 							class="input"
 							type="text"
 							bind:value={f.leadMessage}
-							maxlength="200"
+							maxlength={MAX_CHAT}
 							aria-label="Heads-up message"
 							disabled={!Number(f.leadMinutes)}
 						/>
@@ -1224,7 +1364,7 @@
 							class="input"
 							type="text"
 							bind:value={f.message}
-							maxlength="200"
+							maxlength={MAX_CHAT}
 							aria-label="Message once the window is open"
 							required
 						/>
@@ -1266,7 +1406,7 @@
 							class="input"
 							type="text"
 							bind:value={f.endMessage}
-							maxlength="200"
+							maxlength={MAX_CHAT}
 							aria-label="Message when a match ends"
 							placeholder="Leave empty to say nothing"
 						/>
@@ -1289,7 +1429,7 @@
 							class="input"
 							type="text"
 							bind:value={f.startMessage}
-							maxlength="200"
+							maxlength={MAX_CHAT}
 							aria-label="Message as the next match starts"
 							placeholder="Leave empty to say nothing"
 						/>
@@ -1550,6 +1690,62 @@
 						or below, is unavailable, the player leaves, or the player list cannot be sampled on
 						time.
 					</p>
+				{:else if f.kind === 'two_teams'}
+					<fieldset class="space-y-2">
+						<legend class="field-label">Closed faction</legend>
+						<input
+							class="input w-48"
+							type="text"
+							list="two-teams-factions"
+							bind:value={f.closedFaction}
+							maxlength="100"
+							aria-label="Closed faction"
+							required
+						/>
+						<datalist id="two-teams-factions">
+							{#each FACTIONS as x (x)}<option value={x}></option>{/each}
+						</datalist>
+						<p class="text-[12px] text-mist-600">
+							Everyone on it is moved to whichever of the other two has fewer players, then respawns
+							there.
+						</p>
+					</fieldset>
+					<fieldset class="space-y-2">
+						<legend class="field-label">What players call the two sides (optional)</legend>
+						{#each FACTIONS.filter((x) => x !== f.closedFaction.trim()) as x (x)}
+							<div class="flex flex-wrap items-center gap-2 text-[13px]">
+								<span class="w-24">{x}</span>
+								<input
+									class="input w-40"
+									type="text"
+									maxlength="40"
+									placeholder={x}
+									data-plain
+									value={f.teamNames[x] ?? ''}
+									oninput={(e) => (f.teamNames[x] = e.currentTarget.value)}
+									aria-label="Name for {x}"
+								/>
+							</div>
+						{/each}
+						<p class="text-[12px] text-mist-600">
+							Used for {'{team}'} in the whisper, e.g. Red and Green. Empty keeps the faction name.
+						</p>
+					</fieldset>
+					<fieldset class="space-y-2">
+						<legend class="field-label">Whisper once a player is placed (optional)</legend>
+						<input class="input" type="text" bind:value={f.message} maxlength={MAX_CHAT} />
+						{@render placeholders(['team', 'name', 'server', 'map'])}
+						<p class="text-[12px] text-mist-600">
+							Sent once per player; they are told again only after two hours away. Empty sends
+							nothing.
+						</p>
+					</fieldset>
+					<p class="note">
+						Players are placed a few at a time as the player list refreshes. A player asked to move
+						three times in ten minutes is left where they are until the ten minutes pass. It never
+						moves players between the two open sides, so a manual switch sticks. One rule per
+						server.
+					</p>
 				{:else if f.kind === 'team_kill'}
 					<fieldset class="space-y-2">
 						<legend class="field-label">Whisper</legend>
@@ -1569,7 +1765,7 @@
 							class="input"
 							type="text"
 							bind:value={f.warnMessage}
-							maxlength="200"
+							maxlength={MAX_CHAT}
 							aria-label="Whisper"
 							disabled={!Number(f.warnAt)}
 						/>
@@ -1598,9 +1794,26 @@
 							disabled={!Number(f.kickAt)}
 						/>
 					</fieldset>
+					<fieldset class="space-y-1.5 text-[13px]">
+						<legend class="field-label">Not counted</legend>
+						<div class="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
+							{#each notCountedChoices(f.notCounted) as w (w.cause)}
+								<label class="flex items-center gap-2"
+									><input
+										type="checkbox"
+										checked={holds(f.notCounted, w.cause)}
+										onchange={(e) =>
+											(f.notCounted = e.currentTarget.checked
+												? [...f.notCounted, w.cause]
+												: f.notCounted.filter((c) => c.toLowerCase() !== w.cause.toLowerCase()))}
+									/>
+									{w.label}</label
+								>
+							{/each}
+						</div>
+					</fieldset>
 					<p class="note">
-						Team kills come from the game's kill feed and are counted per player within their
-						current session.
+						Team kills come from the game's kill feed and are counted per player within each match.
 					</p>
 				{:else if f.kind === 'kill_rate'}
 					<fieldset class="space-y-1.5 text-[13px]">
@@ -1670,6 +1883,141 @@
 					<p class="note">
 						Counts kills with hand-held weapons from the kill feed. A flag goes to the audit trail
 						and Discord; nobody is kicked.
+					</p>
+				{:else if f.kind === 'kill_distance'}
+					<fieldset class="space-y-1.5 text-[13px]">
+						<legend class="field-label">Kills with</legend>
+						<div class="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
+							{#each weaponChoices(f.causes) as w (w.cause)}
+								<label class="flex items-center gap-2"
+									><input
+										type="checkbox"
+										checked={holds(f.causes, w.cause)}
+										onchange={(e) =>
+											(f.causes = e.currentTarget.checked
+												? [...f.causes, w.cause]
+												: f.causes.filter((c) => c.toLowerCase() !== w.cause.toLowerCase()))}
+									/>
+									{w.label}</label
+								>
+							{/each}
+						</div>
+					</fieldset>
+					<fieldset class="space-y-1.5 text-[13px]">
+						<legend class="field-label">Catch a player at</legend>
+						<div class="flex flex-wrap items-center gap-2">
+							<input
+								class="input w-20 text-right"
+								type="number"
+								min="1"
+								max="100"
+								bind:value={f.count}
+								aria-label="Catch at, kills in a match"
+								required
+							/>
+							such kill{Number(f.count) === 1 ? '' : 's'} in a match, from at least
+							<input
+								class="input w-24 text-right"
+								type="number"
+								min="1"
+								max="20000"
+								bind:value={f.minDistanceM}
+								aria-label="From at least, metres"
+								required
+							/>
+							m
+						</div>
+					</fieldset>
+					<fieldset class="space-y-1.5 text-[13px]">
+						<legend class="field-label">Then</legend>
+						<label class="flex flex-wrap items-center gap-2 {canModerate ? '' : 'text-mist-600'}"
+							><input
+								type="radio"
+								value="flag"
+								bind:group={f.distanceAction}
+								disabled={!canModerate}
+							/>
+							Flag for staff
+							<span class="text-mist-600">(audit trail and Discord)</span></label
+						>
+						<label class="flex items-center gap-2 {canModerate ? '' : 'text-mist-600'}"
+							><input
+								type="radio"
+								value="kick"
+								bind:group={f.distanceAction}
+								disabled={!canModerate}
+							/> Kick</label
+						>
+						<label class="flex items-center gap-2 {canBanHere || canBanOrg ? '' : 'text-mist-600'}"
+							><input
+								type="radio"
+								value="ban"
+								bind:group={f.distanceAction}
+								disabled={!canBanHere && !canBanOrg}
+							/> Ban</label
+						>
+						{#if f.distanceAction === 'ban'}
+							<div class="space-y-1.5 pl-5">
+								<div class="flex flex-wrap gap-x-4 gap-y-1">
+									<label class="flex items-center gap-2 {canBanHere ? '' : 'text-mist-600'}"
+										><input
+											type="radio"
+											bind:group={f.banScope}
+											value="server"
+											disabled={!canBanHere}
+										/> on this server</label
+									>
+									<label class="flex items-center gap-2 {canBanOrg ? '' : 'text-mist-600'}"
+										><input
+											type="radio"
+											bind:group={f.banScope}
+											value="org"
+											disabled={!canBanOrg}
+										/> on every server in the organisation</label
+									>
+								</div>
+								<div class="flex flex-wrap items-center gap-2">
+									for
+									<input
+										class="input w-20 text-right"
+										type="number"
+										min="0"
+										max="3650"
+										bind:value={f.banDays}
+										aria-label="Ban for, days"
+										required
+									/>
+									days <span class="text-mist-600">(0 is for good)</span>
+								</div>
+							</div>
+						{:else if f.distanceAction === 'flag'}
+							<div class="flex flex-wrap items-center gap-2 pl-5">
+								again after
+								<input
+									class="input w-20 text-right"
+									type="number"
+									min="1"
+									max="1440"
+									bind:value={f.cooldownMinutes}
+									aria-label="Flag again after, minutes"
+									required
+								/>
+								minutes
+							</div>
+						{/if}
+					</fieldset>
+					{#if f.distanceAction !== 'flag'}
+						<fieldset class="space-y-2">
+							<legend class="field-label"
+								>{f.distanceAction === 'ban' ? 'Ban reason' : 'Kick reason'}, shown to the player</legend
+							>
+							<input class="input" type="text" bind:value={f.reason} maxlength="200" />
+							{@render placeholders(['weapon', 'distance', 'count', 'name', 'server'])}
+						</fieldset>
+					{/if}
+					<p class="note">
+						The distance is the kill feed's, between killer and victim. A ban goes on the ban list
+						like one added by hand, and is lifted there.
 					</p>
 				{:else if f.kind === 'seed_reward'}
 					<fieldset class="space-y-1.5 text-[13px]">
@@ -1759,7 +2107,7 @@
 					</fieldset>
 					<fieldset class="space-y-2">
 						<legend class="field-label">Whisper on the grant, blank for none</legend>
-						<input class="input" type="text" bind:value={f.message} maxlength="200" />
+						<input class="input" type="text" bind:value={f.message} maxlength={MAX_CHAT} />
 						{@render placeholders(['name', 'server', 'minutes', 'until', 'days', 'players', 'max'])}
 					</fieldset>
 					<p class="note">
