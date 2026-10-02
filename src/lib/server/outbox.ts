@@ -13,12 +13,18 @@ import type { DbOrTx } from './db';
 import { outbox, triggers, type OutboxRow } from './db/schema';
 import { ACTIONS } from './actions';
 import { GameError, WardogsClient } from './rcon';
-import { ApiError, forLog } from './http';
+import { ApiError, forLog, str } from './http';
 import { LaneFull, LaneTimeout, PRIORITY, withServer } from './dispatcher';
 import { emit } from './events';
 import { isOwner, LostOwnership, ownedSince, withOwnedTransaction } from './leadership';
 import { settings } from './settings';
-import { recordDelivery, SETTINGS_KEYS, type Intent, type TriggerUpdate } from './triggers';
+import {
+	recordDelivery,
+	SETTINGS_KEYS,
+	twoTeamsMoveVerdict,
+	type Intent,
+	type TriggerUpdate
+} from './triggers';
 import { allMemory, memoryOf } from './observe';
 import { grantEntry, listOf, serverListOf } from './lists';
 import { getOrg, getServer } from './access';
@@ -31,6 +37,13 @@ import { writeAudit } from './audit';
 import { PANEL_BAN, type PanelBanParams } from './rule-ban';
 import { queueEvent } from './json-webhook-queue';
 import { seedRewardGranted } from './json-webhook-events';
+import {
+	AFK_ROUND,
+	AFK_ROUND_MAX_AGE_MS,
+	AFK_ROUND_MAX_MS,
+	AFK_ROUND_MAX_PLAYERS
+} from './afk-protection';
+import { MAX_CHAT } from '$lib/chat';
 import type { OutboxView } from '$lib/types';
 
 /** Actions delivered without a game request: they need no roster, only the server's row. */
@@ -48,11 +61,16 @@ const CLAIM_LIMIT = 50;
 const PER_SERVER = 5;
 const PASS_MS = 1000;
 
-/** Writes intents; a dedupe key seen before is dropped silently. Returns how many were new. */
+/**
+ * Writes intents; a dedupe key seen before is dropped silently. Returns how many were new. A watch
+ * only row is written as skipped: its id goes into `watched`, for the caller to announce once the
+ * write is committed.
+ */
 export async function enqueueIntents(
 	db: DbOrTx,
 	serverId: string,
-	intents: Intent[]
+	intents: Intent[],
+	watched?: number[]
 ): Promise<number> {
 	if (!intents.length) return 0;
 	const rows = await db
@@ -69,11 +87,15 @@ export async function enqueueIntents(
 				detail: i.detail,
 				steamId: i.steamId,
 				okMessage: i.okMessage,
-				dedupeKey: i.dedupeKey
+				dedupeKey: i.dedupeKey,
+				...(i.watchOnly
+					? { state: 'skipped', outcome: i.watchOnly.slice(0, 300), doneAt: new Date() }
+					: {})
 			}))
 		)
 		.onConflictDoNothing({ target: outbox.dedupeKey })
-		.returning({ id: outbox.id });
+		.returning({ id: outbox.id, state: outbox.state });
+	if (watched) for (const r of rows) if (r.state === 'skipped') watched.push(r.id);
 	return rows.length;
 }
 
@@ -278,12 +300,24 @@ function skipReason(row: OutboxRow, m: ReturnType<typeof memoryOf>): string | nu
 		return 'Player already left.';
 	if (row.action === 'empty_reset' && (m.players.length > 0 || (m.status?.playerCount ?? 0) > 0))
 		return 'Players arrived before the reset.';
-	// A Two-team move for a player already off the closed faction: the move before it landed, or
-	// they changed side themselves. Moving (and killing) someone twice is not harmless.
+	// An AFK protection round goes only while what the worker last saw still says the server seeds:
+	// a round in a live match kills everyone mid-fight. It goes soon or not at all.
+	if (row.action === AFK_ROUND) {
+		if (age > AFK_ROUND_MAX_AGE_MS) return `Stale (${Math.round(age / 1000)}s old).`;
+		if (!m.status || !m.playersAt) return 'The server has not been looked at yet.';
+		const goal = Number((row.params as { goal?: unknown } | null)?.goal);
+		const count = Math.max(m.status.playerCount || 0, m.players.length);
+		if (m.status.scores.some((s) => s.score > 0) || !(count < goal))
+			return 'The match started before this was sent.';
+	}
+	// A Team balance move for a player already off the side it was decided from: the move before it
+	// landed, or they changed side themselves. Moving (and killing) someone twice is not harmless.
 	if (row.triggerKind === 'two_teams' && row.action === 'changeTeam') {
 		const from = (row.params as { from?: string } | null)?.from;
 		const p = m.players.find((q) => q.steamId === row.steamId);
 		if (from && p && p.faction !== from) return `Already off ${from}.`;
+		const verdict = twoTeamsMoveVerdict(row);
+		if (verdict !== 'send' && verdict !== 'wait') return verdict;
 	}
 	return null;
 }
@@ -295,15 +329,19 @@ function skipReason(row: OutboxRow, m: ReturnType<typeof memoryOf>): string | nu
  */
 function mustWait(row: OutboxRow, m: ReturnType<typeof memoryOf>): boolean {
 	return (
-		!!row.steamId &&
-		!!m?.playersAt &&
-		!m.players.some((p) => p.steamId === row.steamId) &&
-		m.presence.open.has(row.steamId)
+		(!!row.steamId &&
+			!!m?.playersAt &&
+			!m.players.some((p) => p.steamId === row.steamId) &&
+			m.presence.open.has(row.steamId)) ||
+		// a Team balance move whose deciding look is not written yet here
+		(row.triggerKind === 'two_teams' &&
+			row.action === 'changeTeam' &&
+			twoTeamsMoveVerdict(row) === 'wait')
 	);
 }
 
 /**
- * When a Two-team move was last sent for a player, by server and SteamID. The check above can only
+ * When a Team balance move was last sent for a player, by server and SteamID. The check above can only
  * tell a move landed from a player list taken after it, so a second move for the same player waits
  * for one (a retry claimed right behind the first would otherwise read the same list and go too).
  */
@@ -313,7 +351,7 @@ const moveOf = (row: OutboxRow) =>
 		? `${row.serverId}:${row.steamId}`
 		: null;
 
-/** True while a Two-team move for this row's player went out after the last player list. */
+/** True while a Team balance move for this row's player went out after the last player list. */
 function moveUnconfirmed(row: OutboxRow, m: ReturnType<typeof memoryOf>): boolean {
 	const key = moveOf(row);
 	if (!key) return false;
@@ -349,11 +387,17 @@ function noteMoveSent(row: OutboxRow): void {
  */
 function holdsFor(
 	row: OutboxRow,
-	rule: { enabled: boolean; config: unknown } | undefined
+	rule: { enabled: boolean; config: unknown; state?: unknown } | undefined
 ): boolean {
 	if (!rule?.enabled) return false;
 	const key = SETTINGS_KEYS[row.triggerKind];
-	return !key || (row.params as { rule?: string } | null)?.rule === key(rule.config);
+	const params = row.params as { rule?: string; on?: number | null } | null;
+	if (key && params?.rule !== key(rule.config)) return false;
+	// A Team balance move carries the switch-on it was decided under: switched off and on again
+	// since, the rule has started over and the move is not its decision.
+	if (row.triggerKind === 'two_teams' && params?.on !== undefined && 'state' in rule)
+		return params.on === ((rule.state as { enabledAt?: number } | null)?.enabledAt ?? null);
+	return true;
 }
 
 /**
@@ -364,10 +408,10 @@ function holdsFor(
 async function stillHolds(env: Env, row: OutboxRow): Promise<boolean | null> {
 	if (!SETTINGS_KEYS[row.triggerKind]) return true;
 	if (!row.triggerId) return false;
-	let rule: { enabled: boolean; config: unknown } | undefined;
+	let rule: { enabled: boolean; config: unknown; state: unknown } | undefined;
 	try {
 		[rule] = await env.db
-			.select({ enabled: triggers.enabled, config: triggers.config })
+			.select({ enabled: triggers.enabled, config: triggers.config, state: triggers.state })
 			.from(triggers)
 			.where(eq(triggers.id, row.triggerId))
 			.limit(1);
@@ -693,9 +737,87 @@ const messageOf = (r: unknown): string =>
 		? (r as { message: string }).message
 		: '';
 
+/**
+ * One AFK protection round: each player it names who is still on is killed in turn, then the rule's
+ * message goes out. A player gone since, or one the game will not kill (with no living character,
+ * presumably: dead, or not spawned yet; its answer then has not been seen), is passed over. A refusal for sending too fast ends the round and holds the
+ * server; no answer, a refused password or a server error ends it as a failure. After
+ * AFK_ROUND_MAX_MS the rest are left for the next round, so the lane is never held for long. The
+ * result is fixed phrases and counts only.
+ */
+async function afkRound(
+	client: WardogsClient,
+	params: Record<string, unknown>,
+	m: ReturnType<typeof memoryOf>
+): Promise<{ message: string; retryAfterMs?: number }> {
+	const ids = (Array.isArray(params.steamIds) ? params.steamIds : [])
+		.filter((v): v is string => typeof v === 'string')
+		.slice(0, AFK_ROUND_MAX_PLAYERS);
+	const on = new Set((m?.players ?? []).map((p) => p.steamId));
+	const started = Date.now();
+	let killed = 0;
+	let refused = 0;
+	let gone = 0;
+	let left = 0;
+	let retryAfterMs = 0;
+	for (let i = 0; i < ids.length; i++) {
+		if (!on.has(ids[i])) {
+			gone++;
+			continue;
+		}
+		if (Date.now() - started >= AFK_ROUND_MAX_MS) {
+			left = ids.length - i;
+			break;
+		}
+		try {
+			await ACTIONS.kill.run(client, { steamId: ids[i] });
+			killed++;
+		} catch (err) {
+			if (!(err instanceof GameError)) throw err;
+			if (err.code === 'rate_limited') {
+				retryAfterMs = err.retryAfterMs || WAIT_MS;
+				left = ids.length - i;
+				break;
+			}
+			if (
+				err.code === 'unreachable' ||
+				err.status === 401 ||
+				err.status === 403 ||
+				err.status >= 500
+			)
+				throw err;
+			if (err.code === 'player_not_found') gone++;
+			else refused++;
+		}
+	}
+	const message = typeof params.message === 'string' ? str(params.message, MAX_CHAT) : '';
+	let announced = false;
+	if (killed && message && !retryAfterMs)
+		try {
+			await ACTIONS.broadcast.run(client, { message });
+			announced = true;
+		} catch (err) {
+			if (!(err instanceof GameError)) throw err;
+			// The round stands without its message; one refused for sending too fast holds the server.
+			if (err.code === 'rate_limited') retryAfterMs = err.retryAfterMs || WAIT_MS;
+		}
+	const parts = [`Killed ${killed} of ${ids.length}`];
+	if (refused) parts.push(`${refused} refused`);
+	if (gone) parts.push(`${gone} gone`);
+	if (left)
+		parts.push(
+			retryAfterMs
+				? `${left} not reached: the server asked the panel to slow down`
+				: `${left} not reached in time`
+		);
+	if (killed && message) parts.push(announced ? 'announced' : 'message not sent');
+	return { message: `${parts.join(' · ')}.`, ...(retryAfterMs ? { retryAfterMs } : {}) };
+}
+
 /** Runs the row's action; "empty_reset" decides between a rotation edit and a direct change. */
 async function execute(client: WardogsClient, row: OutboxRow): Promise<unknown> {
 	const params = (row.params as Record<string, unknown>) ?? {};
+	if (row.action === AFK_ROUND) return afkRound(client, params, memoryOf(row.serverId));
 	if (row.action === 'empty_reset') {
 		let rotationOn = false;
 		try {
