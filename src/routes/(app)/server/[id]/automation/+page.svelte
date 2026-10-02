@@ -184,14 +184,20 @@
 		{
 			kind: 'two_teams',
 			group: 'Players',
-			label: 'Two-team mode',
-			blurb: 'Close one faction and move its players to the smaller of the other two.'
+			label: 'Team balance',
+			blurb: 'Keep the sides even, and close a faction to play two teams.'
 		},
 		{
 			kind: 'seed_reward',
 			group: 'Players',
 			label: 'Seeding reward',
 			blurb: 'Give players who stay while the server is quiet a reserved slot.'
+		},
+		{
+			kind: 'afk_protection',
+			group: 'Players',
+			label: 'AFK protection',
+			blurb: 'Kill everyone every few minutes while the server seeds, so the idle kick spares them.'
 		},
 		{
 			kind: 'empty_reset',
@@ -207,7 +213,9 @@
 			? 'flag'
 			: action === 'panel_ban'
 				? 'ban'
-				: action;
+				: action === 'afk_round'
+					? 'kill everyone'
+					: action;
 	const label = (kind: TriggerKind) => KINDS.find((k) => k.kind === kind)?.label ?? kind;
 	const blurb = (kind: TriggerKind) => KINDS.find((k) => k.kind === kind)?.blurb ?? '';
 	/** Why a kind cannot run on this server yet, or '' when it can. */
@@ -238,10 +246,10 @@
 	let canSlotHere = $derived(can(data.server.caps, 'slots.manage'));
 	let canSlotOrg = $derived(can(data.server.caps, 'lists.reserve'));
 	/**
-	 * what a Kill distance rule may do: flag or kick (Kick, kill, move), ban on this server's list
-	 * (Bans) or the org's (Org ban list)
+	 * what a Kill distance rule may do: flag or kick (Kick), ban on this server's list (Bans) or the
+	 * org's (Org ban list)
 	 */
-	let canModerate = $derived(can(data.server.caps, 'players.moderate'));
+	let canKick = $derived(can(data.server.caps, 'players.kick'));
 	let canBanHere = $derived(can(data.server.caps, 'bans.manage'));
 	let canBanOrg = $derived(can(data.server.caps, 'lists.ban'));
 	/** Charges that are placed and set off from anywhere: how far away the killer was says nothing. */
@@ -396,14 +404,21 @@
 		headshotMinKills: number;
 		closedFaction: string;
 		teamNames: Record<string, string>;
+		balance: boolean;
+		gap: number;
+		clans: boolean;
+		exempt: string;
+		watchOnly: boolean;
 		causes: string[];
 		minDistanceM: number;
 		count: number;
 		distanceAction: 'flag' | 'kick' | 'ban';
 		banDays: number;
 		banScope: 'server' | 'org';
+		stopAt: number;
+		doneMessage: string;
 	}
-	/** WARDOGS' factions, offered for Two-team mode; a name the game adds later can still be typed. */
+	/** WARDOGS' factions, offered for Team balance; a name the game adds later can still be typed. */
 	const FACTIONS = ['Lonestar', 'Valkyra', 'Manticore'];
 	/** The alphabets a Latin policy can let in, by the name the rule stores and the one people use. */
 	const SCRIPTS: [string, string][] = [
@@ -475,15 +490,17 @@
 						: kind === 'seed_reward'
 							? 'Thanks for seeding {server}, {name}: you have a reserved slot until {until}.'
 							: kind === 'two_teams'
-								? 'This server plays two teams: you have been placed on {team}.'
-								: 'Welcome to {server}, {name}! Read the rules with /rules.'
+								? 'You have been placed on {team}.'
+								: kind === 'afk_protection'
+									? 'Seeding: everyone was respawned so the idle kick spares you. {players} of {goal} on.'
+									: 'Welcome to {server}, {name}! Read the rules with /rules.'
 			),
 			onlyFirstVisit: b('onlyFirstVisit', false),
 			afterFaction: b('afterFaction', false),
 			messages: Array.isArray(c.messages)
 				? (c.messages as string[]).join('\n')
 				: 'Join our Discord for events and support.\nNo team-killing. Admins are watching.',
-			everyMinutes: n('everyMinutes', 15),
+			everyMinutes: n('everyMinutes', kind === 'afk_protection' ? 3 : 15),
 			minPlayers: n('minPlayers', 1),
 			maxPlayers: typeof c.maxPlayers === 'number' ? c.maxPlayers : null,
 			afterMinutes: n('afterMinutes', 20),
@@ -544,9 +561,15 @@
 			maxKills: n('maxKills', 25),
 			headshotPct: n('headshotPct', 70),
 			headshotMinKills: n('headshotMinKills', 15),
-			closedFaction: s('closedFaction', 'Lonestar'),
+			closedFaction: s('closedFaction', ''),
 			teamNames:
 				c.names && typeof c.names === 'object' ? { ...(c.names as Record<string, string>) } : {},
+			// a rule saved before balancing keeps only closing its faction
+			balance: b('balance', !t),
+			gap: n('gap', 3),
+			clans: b('clans', !t),
+			exempt: Array.isArray(c.exempt) ? (c.exempt as string[]).join('\n') : '',
+			watchOnly: b('watchOnly', false),
 			causes: Array.isArray(c.causes)
 				? [...(c.causes as string[])]
 				: ['Id.Item.Defibrillator.Standard'],
@@ -556,12 +579,14 @@
 			distanceAction:
 				c.action === 'flag' || c.action === 'kick' || c.action === 'ban'
 					? c.action
-					: canModerate || (!canBanHere && !canBanOrg)
+					: canKick || (!canBanHere && !canBanOrg)
 						? 'kick'
 						: 'ban',
 			banDays: n('banDays', 0),
 			// a new rule bans where its author may: this server's list first
-			banScope: c.banScope === 'org' ? 'org' : t || canBanHere || !canBanOrg ? 'server' : 'org'
+			banScope: c.banScope === 'org' ? 'org' : t || canBanHere || !canBanOrg ? 'server' : 'org',
+			stopAt: n('stopAt', 20),
+			doneMessage: s('doneMessage', 'Thanks for seeding {server}! The match is live.')
 		};
 		dry = null;
 		pendingSel =
@@ -693,7 +718,19 @@
 							([k, v]) => k !== f.closedFaction.trim() && v?.trim()
 						)
 					),
-					message: f.message
+					message: f.message,
+					balance: f.balance,
+					gap: Number(f.gap),
+					clans: f.clans,
+					exempt: f.exempt.split(/[\s,]+/).filter(Boolean),
+					watchOnly: f.watchOnly
+				};
+			case 'afk_protection':
+				return {
+					everyMinutes: Number(f.everyMinutes),
+					stopAt: Number(f.stopAt),
+					message: f.message,
+					doneMessage: f.doneMessage
 				};
 			case 'seed_reward':
 				return {
@@ -887,14 +924,24 @@
 				const names = Object.entries((c.names as Record<string, string> | undefined) ?? {}).map(
 					([k, v]) => `${k} as ${v}`
 				);
+				const exempt = Array.isArray(c.exempt) ? c.exempt.length : 0;
 				return [
-					`${c.closedFaction} closed, its players moved to the smaller side`,
+					c.watchOnly ? 'Watch only' : '',
+					c.closedFaction
+						? c.balance
+							? `${c.closedFaction} closed`
+							: `${c.closedFaction} closed, its players moved to the smaller side`
+						: '',
+					c.balance ? `sides within ${c.gap ?? 3}${c.clans ? ', clans together' : ''}` : '',
+					exempt ? `${exempt} never moved` : '',
 					names.length ? names.join(', ') : '',
 					c.message ? 'with a whisper' : ''
 				]
 					.filter(Boolean)
 					.join(' · ');
 			}
+			case 'afk_protection':
+				return `kill everyone every ${c.everyMinutes} min while fewer than ${c.stopAt} are on and no side has scored · then off until the server empties or restarts${c.message ? ' · with a broadcast' : ''}${c.doneMessage ? ' · thanks at the start' : ''}`;
 			case 'seed_reward':
 				return `${c.minutes} min with ${c.lowAt} or fewer on${c.untilFull === false ? '' : `, staying until ${typeof c.fullAt === 'number' ? `${c.fullAt}+ on` : 'it fills'}`}, within ${c.windowDays} day${c.windowDays === 1 ? '' : 's'} · slot ${c.scope === 'server' ? 'here' : 'on every server'} for ${c.slotDays} day${c.slotDays === 1 ? '' : 's'}${c.message ? ' · with a whisper' : ''}`;
 		}
@@ -1033,6 +1080,19 @@
 					<div class="mt-0.5 line-clamp-2 text-[13px] text-mist-400">
 						{describe(t.kind, t.config)}
 					</div>
+					{#if t.kind === 'afk_protection' && t.enabled && t.phase}
+						{@const phase = t.phase}
+						<!-- Where it stands: acting while the server seeds, or off since a match went live. -->
+						<div class="mt-0.5 text-[12px] {phase.on ? 'text-mist-100' : 'text-warn'}">
+							{#if phase.on}
+								Active while fewer than {t.config.stopAt} are on
+							{:else}
+								Paused
+								{#if phase.since}<span title={fmtTime(phase.since)}>{fmtAgo(phase.since, now)}</span
+									>{/if}: {phase.why} · back on once the server empties or restarts
+							{/if}
+						</div>
+					{/if}
 					<!-- One of four shapes, most urgent first: failing, off, fired, never fired. -->
 					<div class="mt-0.5 text-[12px] {h?.failing ? 'text-mist-100' : 'text-mist-600'}">
 						{#if h?.failing}
@@ -1691,8 +1751,37 @@
 						time.
 					</p>
 				{:else if f.kind === 'two_teams'}
+					<fieldset class="space-y-2 text-[13px]">
+						<legend class="field-label">Balance</legend>
+						<label class="flex items-center gap-2"
+							><input type="checkbox" bind:checked={f.balance} /> Keep the sides even</label
+						>
+						{#if f.balance}
+							<div class="flex flex-wrap items-center gap-2">
+								Sides may differ by up to
+								<input
+									class="input w-20 text-right"
+									type="number"
+									min="1"
+									max="20"
+									bind:value={f.gap}
+									aria-label="Most the sides may differ by"
+									required
+								/>
+								players
+							</div>
+							<label class="flex items-center gap-2"
+								><input type="checkbox" bind:checked={f.clans} /> Keep clan tags together</label
+							>
+							<p class="text-[12px] text-mist-600">
+								Nobody playing is moved mid-match. An arrival who would put their side past the gap
+								goes to the lighter side, a player who switches onto the bigger side is put back,
+								and a new match is evened up.
+							</p>
+						{/if}
+					</fieldset>
 					<fieldset class="space-y-2">
-						<legend class="field-label">Closed faction</legend>
+						<legend class="field-label">Closed faction (optional)</legend>
 						<input
 							class="input w-48"
 							type="text"
@@ -1700,18 +1789,32 @@
 							bind:value={f.closedFaction}
 							maxlength="100"
 							aria-label="Closed faction"
-							required
+							placeholder="None"
+							required={!f.balance}
 						/>
 						<datalist id="two-teams-factions">
 							{#each FACTIONS as x (x)}<option value={x}></option>{/each}
 						</datalist>
 						<p class="text-[12px] text-mist-600">
-							Everyone on it is moved to whichever of the other two has fewer players, then respawns
-							there.
+							Everyone on it is moved to the smaller other side (or their clan's, within the gap)
+							and respawns there.
 						</p>
 					</fieldset>
 					<fieldset class="space-y-2">
-						<legend class="field-label">What players call the two sides (optional)</legend>
+						<legend class="field-label">Never move (optional)</legend>
+						<textarea
+							class="input font-mono text-[12.5px]"
+							rows="3"
+							data-plain
+							bind:value={f.exempt}
+							aria-label="SteamIDs never moved, one per line"
+							placeholder="SteamID64, one per line"></textarea>
+						<p class="text-[12px] text-mist-600">
+							Staff who switch sides themselves. A move made from the Players tab is kept anyway.
+						</p>
+					</fieldset>
+					<fieldset class="space-y-2">
+						<legend class="field-label">What players call the sides (optional)</legend>
 						{#each FACTIONS.filter((x) => x !== f.closedFaction.trim()) as x (x)}
 							<div class="flex flex-wrap items-center gap-2 text-[13px]">
 								<span class="w-24">{x}</span>
@@ -1740,11 +1843,16 @@
 							nothing.
 						</p>
 					</fieldset>
+					<label class="flex items-center gap-2 text-[13px]"
+						><input type="checkbox" bind:checked={f.watchOnly} /> Watch only: list the moves under Actions,
+						move nobody</label
+					>
 					<p class="note">
-						Players are placed a few at a time as the player list refreshes. A player asked to move
-						three times in ten minutes is left where they are until the ten minutes pass. It never
-						moves players between the two open sides, so a manual switch sticks. One rule per
-						server.
+						Moves go out a few at a time as the player list refreshes; each kills the player so they
+						respawn on the new side. A player asked to move three times in ten minutes is left where
+						they are until the ten minutes pass.{f.balance
+							? ''
+							: ' Players are never moved between the open sides.'} One rule per server.
 					</p>
 				{:else if f.kind === 'team_kill'}
 					<fieldset class="space-y-2">
@@ -1930,23 +2038,13 @@
 					</fieldset>
 					<fieldset class="space-y-1.5 text-[13px]">
 						<legend class="field-label">Then</legend>
-						<label class="flex flex-wrap items-center gap-2 {canModerate ? '' : 'text-mist-600'}"
-							><input
-								type="radio"
-								value="flag"
-								bind:group={f.distanceAction}
-								disabled={!canModerate}
-							/>
+						<label class="flex flex-wrap items-center gap-2 {canKick ? '' : 'text-mist-600'}"
+							><input type="radio" value="flag" bind:group={f.distanceAction} disabled={!canKick} />
 							Flag for staff
 							<span class="text-mist-600">(audit trail and Discord)</span></label
 						>
-						<label class="flex items-center gap-2 {canModerate ? '' : 'text-mist-600'}"
-							><input
-								type="radio"
-								value="kick"
-								bind:group={f.distanceAction}
-								disabled={!canModerate}
-							/> Kick</label
+						<label class="flex items-center gap-2 {canKick ? '' : 'text-mist-600'}"
+							><input type="radio" value="kick" bind:group={f.distanceAction} disabled={!canKick} /> Kick</label
 						>
 						<label class="flex items-center gap-2 {canBanHere || canBanOrg ? '' : 'text-mist-600'}"
 							><input
@@ -2018,6 +2116,48 @@
 					<p class="note">
 						The distance is the kill feed's, between killer and victim. A ban goes on the ban list
 						like one added by hand, and is lifted there.
+					</p>
+				{:else if f.kind === 'afk_protection'}
+					<fieldset class="space-y-2">
+						<legend class="field-label">When</legend>
+						<div class="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[13px]">
+							Kill everyone every
+							<input
+								class="input w-20 text-right"
+								type="number"
+								min="2"
+								max="10"
+								bind:value={f.everyMinutes}
+								aria-label="Every, minutes"
+								required
+							/>
+							min while fewer than
+							<input
+								class="input w-20 text-right"
+								type="number"
+								min="2"
+								max="1000"
+								bind:value={f.stopAt}
+								aria-label="Fewer than, players"
+								required
+							/>
+							are on and no side has scored
+						</div>
+					</fieldset>
+					<fieldset class="space-y-2">
+						<legend class="field-label">Broadcast after each round, blank for none</legend>
+						<input class="input" type="text" bind:value={f.message} maxlength={MAX_CHAT} />
+						{@render placeholders(['players', 'goal', 'server', 'map', 'max'])}
+					</fieldset>
+					<fieldset class="space-y-2">
+						<legend class="field-label">Broadcast when the match goes live, blank for none</legend>
+						<input class="input" type="text" bind:value={f.doneMessage} maxlength={MAX_CHAT} />
+						{@render placeholders(['players', 'server', 'map', 'max'])}
+					</fieldset>
+					<p class="note">
+						Everyone on is killed, players included. Off once a side scores or the count is reached,
+						until the server has been empty for 10 minutes or restarts. Switching it off stops the
+						next round.
 					</p>
 				{:else if f.kind === 'seed_reward'}
 					<fieldset class="space-y-1.5 text-[13px]">
