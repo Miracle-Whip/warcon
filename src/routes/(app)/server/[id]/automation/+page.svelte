@@ -220,7 +220,9 @@
 					? 'kill everyone'
 					: action === 'rule_kill'
 						? 'kill'
-						: action;
+						: action === 'kill_distance_skip'
+							? 'not counted'
+							: action;
 	const label = (kind: TriggerKind) => KINDS.find((k) => k.kind === kind)?.label ?? kind;
 	const blurb = (kind: TriggerKind) => KINDS.find((k) => k.kind === kind)?.blurb ?? '';
 	/** Why a kind cannot run on this server yet, or '' when it can. */
