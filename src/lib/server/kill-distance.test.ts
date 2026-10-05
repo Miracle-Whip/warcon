@@ -12,6 +12,7 @@ import {
 	killsAfterDeath,
 	killsAfterDeathReplay,
 	matchKey,
+	notCountedMessage,
 	validateKillDistance,
 	type DistanceTracks,
 	type KillDistanceConfig,
@@ -202,8 +203,9 @@ describe('killsAfterDeath', () => {
 		// the same instant twice: one shell, two victims
 		const shell = [kill(A, B, 3388.23), kill(A, C, 3388.23)];
 		const out = killsAfterDeath(deaths, [before, died, ...shell], 0);
-		// not the kill A made before dying, nor the one that killed A
-		expect([...out]).toEqual(shell.map((k) => k.eventId));
+		// not the kill A made before dying, nor the one that killed A; each with how long after
+		expect([...out.keys()]).toEqual(shell.map((k) => k.eventId));
+		expect([...out.values()].map((s) => s.toFixed(2))).toEqual(['4.26', '4.26']);
 	});
 	test('after the death, up to the window and not after it, on the match clock', () => {
 		const at = (gap: number) => {
@@ -221,7 +223,7 @@ describe('killsAfterDeath', () => {
 		const deaths: LastDeaths = new Map();
 		killsAfterDeath(deaths, [kill(C, A, 3383.97)], 0);
 		const next = kill(A, B, 3388.23);
-		expect([...killsAfterDeath(deaths, [next], 4000)]).toEqual([next.eventId]);
+		expect([...killsAfterDeath(deaths, [next], 4000).keys()]).toEqual([next.eventId]);
 		// a new match: the clock started again, and A has not died in it
 		const first = kill(A, B, 30);
 		expect(killsAfterDeath(deaths, [first], 30_000).size).toBe(0);
@@ -235,6 +237,14 @@ describe('killsAfterDeath', () => {
 		).toBe(true);
 		expect(killsAfterDeath(deaths, [soon], 2 * AFTER_DEATH_S * 1000 + 1).size).toBe(0);
 		expect(deaths.has(A)).toBe(false);
+	});
+	test('what the audit trail says of a kill left out', () => {
+		expect(notCountedMessage('Gunner', 'Id.Item.M4', 2295.25, 4.26)).toBe(
+			'Not counted: M4 kill from 2295 m by Gunner, 4.3 s after they died'
+		);
+		expect(
+			notCountedMessage('Gunner', 'Vehicle.Variant.Land.Wheeled.Humvee.Default', null, 12)
+		).toBe('Not counted: Humvee kill by Gunner, 12.0 s after they died');
 	});
 	test('replayed batch by batch, as they came in', () => {
 		const at = (e: ReturnType<typeof kill>, ms: number) => ({ ...e, at: ms });

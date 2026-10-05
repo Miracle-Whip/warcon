@@ -17,6 +17,11 @@ import type { BanScope } from './rule-ban';
 
 /** The outbox action of a Kill distance flag: a panel action, nothing is sent to the game. */
 export const KILL_DISTANCE_FLAG = 'kill_distance_flag';
+/**
+ * The outbox action that notes a kill a rule left out because it came just after the killer's own
+ * death (killsAfterDeath): a panel action whose audit row is the whole delivery, kept off Discord.
+ */
+export const KILL_DISTANCE_SKIP = 'kill_distance_skip';
 
 export type KillDistanceAction = 'flag' | 'warn' | 'kill' | 'kick' | 'ban';
 
@@ -143,18 +148,41 @@ export interface FeedDeath {
 /**
  * Takes in a batch of kills that came in at `at` (ms), in the order the game played them: notes
  * each victim's death, and returns the kills made within AFTER_DEATH_S after the killer's own last
- * death, by event id. Two players who kill each other at the same instant both count. The match
- * clock starts again at a new match, so a death later on it than the kill is not the one before it.
+ * death, by event id, with how many seconds after it. Two players who kill each other at the same
+ * instant both count. The match clock starts again at a new match, so a death later on it than the
+ * kill is not the one before it.
  */
-export function killsAfterDeath(deaths: LastDeaths, inOrder: FeedDeath[], at: number): Set<string> {
+export function killsAfterDeath(
+	deaths: LastDeaths,
+	inOrder: FeedDeath[],
+	at: number
+): Map<string, number> {
 	for (const [steamId, d] of deaths) if (at - d.at > DEATH_KEPT_MS) deaths.delete(steamId);
-	const out = new Set<string>();
+	const out = new Map<string, number>();
 	for (const k of inOrder) {
 		const d = k.killer ? deaths.get(k.killer) : undefined;
-		if (d && k.eventTime > d.clock && k.eventTime - d.clock <= AFTER_DEATH_S) out.add(k.eventId);
+		if (d && k.eventTime > d.clock && k.eventTime - d.clock <= AFTER_DEATH_S)
+			out.set(k.eventId, k.eventTime - d.clock);
 		deaths.set(k.victim, { clock: k.eventTime, at });
 	}
 	return out;
+}
+
+/**
+ * What the audit trail says of a kill a rule left out because it came just after the killer's own
+ * death: the kill, by whom, and how long after they died.
+ */
+export function notCountedMessage(
+	name: string,
+	cause: string | null,
+	distanceM: number | null,
+	afterS: number
+): string {
+	const what =
+		distanceM === null
+			? `${causeLabel(cause)} kill`
+			: `${causeLabel(cause)} kill from ${Math.round(distanceM)} m`;
+	return `Not counted: ${what} by ${name}, ${afterS.toFixed(1)} s after they died`;
 }
 
 /**
@@ -167,7 +195,7 @@ export function killsAfterDeathReplay(events: (FeedDeath & { at: number })[]): S
 	for (let i = 0; i < events.length;) {
 		let j = i;
 		while (j < events.length && events[j].at === events[i].at) j++;
-		for (const id of killsAfterDeath(deaths, events.slice(i, j), events[i].at)) out.add(id);
+		for (const id of killsAfterDeath(deaths, events.slice(i, j), events[i].at).keys()) out.add(id);
 		i = j;
 	}
 	return out;

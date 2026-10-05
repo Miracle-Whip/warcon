@@ -36,10 +36,12 @@ import {
 } from './kill-rate';
 import {
 	countsForDistance,
+	KILL_DISTANCE_SKIP,
 	killDistanceSettingsKey,
 	killDistanceStep,
 	killsAfterDeath,
 	matchKey,
+	notCountedMessage,
 	type DistanceTrack,
 	type DistanceTracks,
 	type KillDistanceConfig,
@@ -244,27 +246,57 @@ async function actOnKillDistance(
 	const counted = rows
 		.map((row) => {
 			const cfg = row.config as KillDistanceConfig;
-			const hits = inOrder.filter((k) =>
-				countsForDistance(cfg, {
+			const hits: KillView[] = [];
+			// the kills it would have counted but for the killer's own death just before
+			const leftOut: { k: KillView; afterS: number }[] = [];
+			for (const k of inOrder) {
+				const kill = {
 					killer: k.killer?.steamId,
 					suicide: k.suicide,
-					afterOwnDeath: afterDeath.has(k.eventId),
 					cause: k.cause,
 					distanceM: k.distanceM
-				})
-			);
-			return { row, cfg, hits };
+				};
+				const afterS = afterDeath.get(k.eventId);
+				if (countsForDistance(cfg, { ...kill, afterOwnDeath: afterS !== undefined })) hits.push(k);
+				else if (afterS !== undefined && countsForDistance(cfg, { ...kill, afterOwnDeath: false }))
+					leftOut.push({ k, afterS });
+			}
+			return { row, cfg, hits, leftOut };
 		})
-		.filter((r) => r.hits.length);
+		.filter((r) => r.hits.length || r.leftOut.length);
 	if (!counted.length) return;
 	const now = Date.now();
-	const match = matchKey(await stampedMatch(env, serverId, batch), Date.parse(batch[0].ts));
+	const match = counted.some((r) => r.hits.length)
+		? matchKey(await stampedMatch(env, serverId, batch), Date.parse(batch[0].ts))
+		: '';
 	if (!mine) distanceMemory.set(serverId, (mine = new Map()));
 	const out: Evaluation = { intents: [], updates: [] };
 	// Acting starts the player's hold; if the action cannot be queued, neither does the hold.
 	const acted: { track: DistanceTrack; before: number | null }[] = [];
-	for (const { row, cfg, hits } of counted) {
+	for (const { row, cfg, hits, leftOut } of counted) {
 		const settings = killDistanceSettingsKey(cfg);
+		// Each left-out kill is noted in the audit trail, so staff can see why the rule let it be.
+		for (const { k, afterS } of leftOut) {
+			const steamId = k.killer!.steamId;
+			const name = k.killer!.name || steamId;
+			out.intents.push({
+				trigger: row,
+				action: KILL_DISTANCE_SKIP,
+				params: { rule: settings },
+				target: steamId,
+				okMessage: notCountedMessage(name, k.cause, k.distanceM, afterS),
+				detail: {
+					name,
+					cause: k.cause,
+					distanceM: k.distanceM,
+					afterDeathS: Math.round(afterS * 10) / 10,
+					eventId: k.eventId
+				},
+				steamId: null,
+				dedupeKey: [row.id, steamId, k.eventId, 'skip'].join(':')
+			});
+		}
+		if (!hits.length) continue;
 		let entry = mine.get(row.id);
 		if (!entry || entry.match !== match || entry.settings !== settings) {
 			entry = { settings, match, tracks: new Map() };

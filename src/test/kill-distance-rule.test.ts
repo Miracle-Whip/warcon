@@ -28,7 +28,7 @@ import { forgetMemory, memoryFor, observeServer } from '$lib/server/observe';
 import { startDelivery, stopDelivery } from '$lib/server/outbox';
 import { WardogsClient } from '$lib/server/rcon';
 import { dryRun, invalidateTriggers, validateConfig } from '$lib/server/triggers';
-import { KILL_DISTANCE_FLAG } from '$lib/server/kill-distance';
+import { KILL_DISTANCE_FLAG, KILL_DISTANCE_SKIP } from '$lib/server/kill-distance';
 import { PANEL_BAN } from '$lib/server/rule-ban';
 import { RULE_KILL } from '$lib/server/rule-kill';
 import { newId } from '$lib/server/http';
@@ -283,14 +283,14 @@ describe.skipIf(!hasTestDb)('Kill distance rule, live', () => {
 		expect(await rowsOf(id)).toHaveLength(0);
 	});
 
-	test('a kill just after the killer’s own death is not counted: a shell that landed after their vehicle was destroyed', async () => {
+	test('a kill just after the killer’s own death is not counted, and the audit trail says so: a shell that landed after their vehicle was destroyed', async () => {
 		const w = await seedWorld(env);
 		await openMatch(w.server.id);
 		const id = await rule(w, w.server.id, {
 			causes: [M4],
 			minDistanceM: 1300,
 			count: 1,
-			action: 'kick'
+			action: 'flag'
 		});
 		// the gunner's vehicle destroyed with them in it, then their shell landing on two players
 		// at once, credited to the rifle they carry
@@ -306,14 +306,55 @@ describe.skipIf(!hasTestDb)('Kill distance rule, live', () => {
 			ev(ENEMY, { cause: ENEMY_GUN, distanceM: 2400, eventTime: 3390, victim: SNIPER }),
 			ev(SNIPER, { cause: M4, distanceM: 2410, eventTime: 3396 })
 		]);
-		expect(await rowsOf(id)).toHaveLength(0);
+		// nothing done to anyone; each kill left out is a note, sent nothing and asked of no one
+		const notes = await rowsOf(id);
+		expect(notes.map((r) => [r.action, r.target, r.steamId, r.okMessage])).toEqual([
+			[
+				KILL_DISTANCE_SKIP,
+				GUNNER,
+				null,
+				'Not counted: M4 kill from 2295 m by p806, 4.3 s after they died'
+			],
+			[
+				KILL_DISTANCE_SKIP,
+				GUNNER,
+				null,
+				'Not counted: M4 kill from 2280 m by p806, 4.3 s after they died'
+			],
+			[
+				KILL_DISTANCE_SKIP,
+				SNIPER,
+				null,
+				'Not counted: M4 kill from 2410 m by p803, 6.0 s after they died'
+			]
+		]);
+		// written while the rule holds the settings it was decided under, like a flag
+		expect((notes[0].params as { rule?: string }).rule).toMatch(/^[A-Za-z0-9_-]{16}$/);
+		const done = await deliver(...notes.map((r) => r.id));
+		expect(done.map((d) => [d.state, d.outcome])).toEqual(
+			notes.map((r) => ['delivered', r.okMessage])
+		);
+		const audited = await auditSoon(w.server.id, 'trigger.kill_distance', SNIPER);
+		expect(audited.map((a) => [a.outcome, a.category, a.message])).toEqual([
+			['ok', 'trigger', 'Not counted: M4 kill from 2410 m by p803, 6.0 s after they died']
+		]);
+		expect(audited[0].detail).toMatchObject({
+			rconAction: KILL_DISTANCE_SKIP,
+			cause: M4,
+			distanceM: 2410,
+			afterDeathS: 6
+		});
 		// a living player's kill from as far counts, and so does the gunner's a minute on
 		await post(w.server.id, [ev(CHEAT, { cause: M4, distanceM: 2300, eventTime: 3400 })]);
 		await post(w.server.id, [ev(GUNNER, { cause: M4, distanceM: 2300, eventTime: 3445 })]);
-		expect((await rowsOf(id)).map((r) => [r.steamId, r.okMessage])).toEqual([
-			[CHEAT, 'Kicked p801: M4 kill from 2300 m'],
-			[GUNNER, 'Kicked p806: M4 kill from 2300 m']
+		const acted = (await rowsOf(id)).filter((r) => r.action !== KILL_DISTANCE_SKIP);
+		expect(acted.map((r) => [r.action, r.steamId, r.okMessage])).toEqual([
+			[KILL_DISTANCE_FLAG, CHEAT, 'Flagged p801: M4 kill from 2300 m'],
+			[KILL_DISTANCE_FLAG, GUNNER, 'Flagged p806: M4 kill from 2300 m']
 		]);
+		// the notes and flags asked nothing of the game
+		expect(sent.filter(([s]) => s === w.server.id)).toEqual([]);
+		expect(kicked.filter(([s]) => s === w.server.id)).toEqual([]);
 	});
 
 	test('a warning on a Humvee’s guns from 0 m: whispered once in the cooldown, a kill without a distance too, in the panel’s words', async () => {
@@ -964,7 +1005,7 @@ describe.skipIf(!hasTestDb)('Kill distance rule, live', () => {
 		);
 	});
 
-	test('nothing a person or a key can call runs a rule’s ban, flag or kill', async () => {
+	test('nothing a person or a key can call runs a rule’s ban, flag, note or kill', async () => {
 		const w = await seedWorld(env);
 		const mod = await import(
 			join(
@@ -979,7 +1020,7 @@ describe.skipIf(!hasTestDb)('Kill distance rule, live', () => {
 				'+server.ts'
 			)
 		);
-		for (const action of [PANEL_BAN, KILL_DISTANCE_FLAG, RULE_KILL]) {
+		for (const action of [PANEL_BAN, KILL_DISTANCE_FLAG, KILL_DISTANCE_SKIP, RULE_KILL]) {
 			const r = await callApi(mod.POST, w.users.owner, {
 				method: 'POST',
 				params: { id: w.server.id, action },
