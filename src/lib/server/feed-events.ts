@@ -38,10 +38,12 @@ import {
 	countsForDistance,
 	killDistanceSettingsKey,
 	killDistanceStep,
+	killsAfterDeath,
 	matchKey,
 	type DistanceTrack,
 	type DistanceTracks,
-	type KillDistanceConfig
+	type KillDistanceConfig,
+	type LastDeaths
 } from './kill-distance';
 import { applyTriggerUpdates, enqueueIntents, wakeDelivery } from './outbox';
 import { LostOwnership, withOwnedTransaction } from './leadership';
@@ -172,11 +174,21 @@ interface DistanceMemory {
 	tracks: DistanceTracks;
 }
 const distanceMemory = new Map<string, Map<string, DistanceMemory>>();
+/**
+ * Each server's last deaths per player, so a kill just after the killer's own death is not counted
+ * (killsAfterDeath) when the death came in an earlier batch. Kept, and forgotten, with the counts.
+ */
+const lastDeaths = new Map<string, LastDeaths>();
 
 /** Forgets the Kill distance counts of one server (removed from the worker), or of every server. */
 export function forgetKillDistance(serverId?: string): void {
-	if (serverId) distanceMemory.delete(serverId);
-	else distanceMemory.clear();
+	if (serverId) {
+		distanceMemory.delete(serverId);
+		lastDeaths.delete(serverId);
+	} else {
+		distanceMemory.clear();
+		lastDeaths.clear();
+	}
 }
 
 /**
@@ -209,13 +221,26 @@ async function actOnKillDistance(
 	let mine = distanceMemory.get(serverId);
 	if (!rows.length) {
 		if (mine) distanceMemory.delete(serverId);
+		lastDeaths.delete(serverId);
 		return;
 	}
 	const live = new Set(rows.map((r) => r.id));
 	if (mine) for (const id of mine.keys()) if (!live.has(id)) mine.delete(id);
 	// The kills each rule counts, in the order the game played them. Most batches have none, and
-	// then nothing is read.
+	// then nothing is read; every batch's deaths are noted all the same.
 	const inOrder = [...batch].sort((a, b) => a.eventTime - b.eventTime);
+	let deaths = lastDeaths.get(serverId);
+	if (!deaths) lastDeaths.set(serverId, (deaths = new Map()));
+	const afterDeath = killsAfterDeath(
+		deaths,
+		inOrder.map((k) => ({
+			eventId: k.eventId,
+			eventTime: k.eventTime,
+			killer: k.killer?.steamId,
+			victim: k.victim.steamId
+		})),
+		Date.parse(batch[0].ts)
+	);
 	const counted = rows
 		.map((row) => {
 			const cfg = row.config as KillDistanceConfig;
@@ -223,6 +248,7 @@ async function actOnKillDistance(
 				countsForDistance(cfg, {
 					killer: k.killer?.steamId,
 					suicide: k.suicide,
+					afterOwnDeath: afterDeath.has(k.eventId),
 					cause: k.cause,
 					distanceM: k.distanceM
 				})

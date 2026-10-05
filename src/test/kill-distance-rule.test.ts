@@ -47,12 +47,23 @@ const SNIPER = '76561198000000803';
 const VICTIM = '76561198000000804';
 /** a player the server does not list */
 const GONE = '76561198000000805';
+/** a gunner whose vehicle is destroyed with a shell in the air, and the enemy who destroys it */
+const GUNNER = '76561198000000806';
+const ENEMY = '76561198000000807';
+const M4 = 'Id.Item.M4';
+const ENEMY_GUN = 'Id.Vehicle.WeaponExtension.STN_05.MainBarrel';
 const REASON = 'Impossible kill: Defibrillator from 4057 m.';
 
 /** One `killed` event as the game posts it; distance in metres here, centimetres on the wire. */
 const ev = (
 	killer: string | null,
-	o: { cause?: string; distanceM?: number | null; eventTime?: number; suicide?: boolean } = {}
+	o: {
+		cause?: string;
+		distanceM?: number | null;
+		eventTime?: number;
+		suicide?: boolean;
+		victim?: string;
+	} = {}
 ) => ({
 	eventId: newId(),
 	type: 'killed',
@@ -60,8 +71,8 @@ const ev = (
 	matchId: 'boot',
 	mapName: 'Kavkazi',
 	...(killer ? { killerName: `p${killer.slice(-3)}`, killerSteamId: killer } : {}),
-	victimName: 'victim',
-	victimSteamId: VICTIM,
+	victimName: o.victim ? `p${o.victim.slice(-3)}` : 'victim',
+	victimSteamId: o.victim ?? VICTIM,
 	cause: o.cause ?? DEFIB,
 	...(o.distanceM === null ? {} : { distance: (o.distanceM ?? 4057) * 100 }),
 	contextTags: o.suicide ? ['Meta.Progression.Context.Player.KillContext.Suicide'] : []
@@ -270,6 +281,39 @@ describe.skipIf(!hasTestDb)('Kill distance rule, live', () => {
 			ev(null)
 		]);
 		expect(await rowsOf(id)).toHaveLength(0);
+	});
+
+	test('a kill just after the killer’s own death is not counted: a shell that landed after their vehicle was destroyed', async () => {
+		const w = await seedWorld(env);
+		await openMatch(w.server.id);
+		const id = await rule(w, w.server.id, {
+			causes: [M4],
+			minDistanceM: 1300,
+			count: 1,
+			action: 'kick'
+		});
+		// the gunner's vehicle destroyed with them in it, then their shell landing on two players
+		// at once, credited to the rifle they carry
+		await post(w.server.id, [
+			ev(ENEMY, { cause: ENEMY_GUN, distanceM: 2297, eventTime: 3383.97, victim: GUNNER })
+		]);
+		await post(w.server.id, [
+			ev(GUNNER, { cause: M4, distanceM: 2295, eventTime: 3388.23, victim: ENEMY }),
+			ev(GUNNER, { cause: M4, distanceM: 2280, eventTime: 3388.23 })
+		]);
+		// another gunner's death and their shell in one batch
+		await post(w.server.id, [
+			ev(ENEMY, { cause: ENEMY_GUN, distanceM: 2400, eventTime: 3390, victim: SNIPER }),
+			ev(SNIPER, { cause: M4, distanceM: 2410, eventTime: 3396 })
+		]);
+		expect(await rowsOf(id)).toHaveLength(0);
+		// a living player's kill from as far counts, and so does the gunner's a minute on
+		await post(w.server.id, [ev(CHEAT, { cause: M4, distanceM: 2300, eventTime: 3400 })]);
+		await post(w.server.id, [ev(GUNNER, { cause: M4, distanceM: 2300, eventTime: 3445 })]);
+		expect((await rowsOf(id)).map((r) => [r.steamId, r.okMessage])).toEqual([
+			[CHEAT, 'Kicked p801: M4 kill from 2300 m'],
+			[GUNNER, 'Kicked p806: M4 kill from 2300 m']
+		]);
 	});
 
 	test('a warning on a Humvee’s guns from 0 m: whispered once in the cooldown, a kill without a distance too, in the panel’s words', async () => {
@@ -862,6 +906,61 @@ describe.skipIf(!hasTestDb)('Kill distance rule, live', () => {
 		]);
 		expect(far.notes).toContain(
 			'1 kill with Humvee M249 from 1 m or more in the window, counted per match.'
+		);
+	});
+
+	test('the dry run leaves out a kill just after the killer’s own death, and says so', async () => {
+		const w = await seedWorld(env);
+		const at = Date.now() - 600_000;
+		const row = (
+			killer: string,
+			victim: string,
+			cause: string,
+			distanceM: number,
+			eventTime: number,
+			receivedMs: number
+		) => ({
+			ts: new Date(at + receivedMs),
+			serverId: w.server.id,
+			eventId: newId(),
+			instanceId: 'i',
+			matchId: 'm',
+			matchRow: 9201,
+			eventTime,
+			map: 'Kavkazi',
+			killerSteamId: killer,
+			killerName: `p${killer.slice(-3)}`,
+			victimSteamId: victim,
+			victimName: `p${victim.slice(-3)}`,
+			cause,
+			distanceM,
+			tags: []
+		});
+		await env.db
+			.insert(kills)
+			.values([
+				row(ENEMY, GUNNER, ENEMY_GUN, 2297, 3383.97, 0),
+				row(GUNNER, ENEMY, M4, 2295, 3388.23, 4000),
+				row(GUNNER, VICTIM, M4, 2280, 3388.23, 4000),
+				row(CHEAT, VICTIM, M4, 2300, 3394, 10_000),
+				row(GUNNER, VICTIM, M4, 2300, 3445, 62_000)
+			]);
+		const server = { ...w.server, name: 'one' } as Parameters<typeof dryRun>[1];
+		const r = await dryRun(env, server, 'kill_distance', {
+			causes: [M4],
+			minDistanceM: 1300,
+			count: 1,
+			action: 'kick'
+		});
+		expect(r.items.map((i) => i.text)).toEqual([
+			`kick p801 (${CHEAT}): M4 kill from 2300 m`,
+			`kick p806 (${GUNNER}): M4 kill from 2300 m`
+		]);
+		expect(r.notes).toContain(
+			'2 kills with M4 from 1300 m or more in the window, counted per match.'
+		);
+		expect(r.notes).toContain(
+			'2 more came within a minute of the killer’s own death and are not counted: a vehicle’s shell that lands after the vehicle was destroyed comes credited to the gunner’s own weapon.'
 		);
 	});
 
