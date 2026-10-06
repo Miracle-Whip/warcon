@@ -252,6 +252,7 @@ scraped as job `postgres`, which is optional.
 | `warcon_http_requests_total{route,method,status}`, `warcon_http_request_seconds`      | Every request by SvelteKit route id (web).                                                  |
 | `warcon_feed_posts_total{outcome}`, `warcon_feed_kills_total{result}`                 | Kill feed batches accepted, refused or rejected, and events accepted, skipped or duplicate. |
 | `warcon_rate_limited_total{scope}`                                                    | Requests the in-memory limiter refused, by the limit that fired.                            |
+| `warcon_board_reads_total{outcome}`                                                   | Board pages from the minute cache (hit), a read in progress (shared) or read anew (miss).   |
 | `warcon_fleet{table}`                                                                 | Row counts of organizations, users, servers, org members, webhooks and triggers (web).      |
 | `process_*`, `nodejs_*`                                                               | CPU, memory and event-loop lag of each process.                                             |
 
@@ -731,7 +732,9 @@ cash is summed over sessions, each banked across its matches like kills. Names l
 A page of a board is read at most once a minute for the same servers and settings, so a match
 that just ended can take up to a minute to appear (a stats purge shows at once). All time is read
 from each player's totals per server, which the database keeps as sessions close and matches end,
-plus the sessions still open; 7, 30 and 90 days sum the match rows and sessions in the range.
+plus the sessions still open; 7, 30 and 90 days from the same totals kept per UTC day, plus the
+part of the range's first day and the sessions still open, so a range still starts to the second
+(now minus 7 days), not at a midnight.
 
 **Export CSV** on the tab downloads the board as it is set (scope, range, sort, playtime floor),
 from the top and every page of it, up to 10,000 players: rank, SteamID, name, playtime and seed
@@ -1522,14 +1525,21 @@ settings) · `serverLog` (Audit trail) · `raw` (Raw RCON).
   see aim, position, input or IP addresses; anything claiming to detect aimbots from the RCON API
   is guessing.
 - Each player's totals per server (the all-time boards, career ranks, the placeholders' stats and
-  the risk score's record of matches) are kept by triggers in the database, in the same
-  transaction as whatever closes a session, ends a match or changes either afterwards, so a hand
-  repair of a session, a match or a match row keeps them right by itself. Start such a repair with
-  `SELECT player_totals_lock('<server id>');` and keep the default READ COMMITTED isolation (the
-  triggers refuse any other). A bulk load (a backfill of history; a `TRUNCATE` of
-  `player_sessions`, `matches` or `match_players`, which fires no trigger) runs in one transaction
-  that disables the `player_totals_*` triggers on those tables, loads, runs
-  `SELECT player_totals_rebuild();` and enables them again: writers wait for it, readers do not.
+  the risk score's record of matches) and per server per UTC day (the 7, 30 and 90-day boards) are
+  kept by triggers in the database, in the same transaction as whatever closes a session, ends a
+  match or changes either afterwards, so a hand repair of a session, a match or a match row keeps
+  them right by itself. Start such a repair with `SELECT player_totals_lock('<server id>');` and
+  keep the default READ COMMITTED isolation (the triggers refuse any other). A closed session's
+  `last_seen` must equal its `left_at` (the panel closes sessions so, and the ranged boards rely on
+  it): the triggers refuse an edit that breaks that, so a repair that moves when a session ended
+  sets both, and the migration that adds the day totals stops, before it locks anything, if a
+  database already holds such a session: set one to the other first (for instance
+  `UPDATE player_sessions SET last_seen = left_at WHERE left_at <> last_seen;`, which keeps the time
+  the boards count playtime to) and deploy again. A bulk load (a backfill of history; a `TRUNCATE`
+  of `player_sessions`, `matches` or `match_players`, which fires no trigger) runs in one
+  transaction that disables the `player_totals_*` triggers on those tables, loads, runs
+  `SELECT player_totals_rebuild();` (both kinds of totals; it refuses to run over a closed session
+  that breaks the rule) and enables them again: writers wait for it, readers do not.
 - Audit rows are never deleted by the panel. Prune them with SQL if you need to. Deleting an
   account pseudonymises its rows rather than removing them (see
   [Accounts and personal data](#accounts-and-personal-data)).
