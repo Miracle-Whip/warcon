@@ -1,11 +1,12 @@
-// The all-time reads as they were before player_totals (main at edf2aab), word for word, for the
-// exactness tests to hold the totals against: each sums every session and every line of an ended
-// match on the servers asked about. Frozen on purpose: if the reads' meaning changes, this file
-// changes with it in the same commit, deliberately. totalsRows, at the end, is the other side.
+// The all-time and ranged reads as they were before player_totals and player_days (main at
+// edf2aab), word for word, for the exactness tests to hold the totals against: each sums every
+// session and every line of an ended match on the servers asked about, since `from` (the epoch for
+// all time). Frozen on purpose: if the reads' meaning changes, this file changes with it in the
+// same commit, deliberately. totalsRows and rangeRows, at the end, are the other side.
 import { sql, type SQL } from 'drizzle-orm';
 import type { DbOrTx } from '$lib/server/db';
 import { DEFAULT_FLOOR_MINUTES, type BoardMetric, type BoardQuery } from '$lib/leaderboard';
-import { totalsBase } from '$lib/server/leaderboards';
+import { rangeBase, totalsBase } from '$lib/server/leaderboards';
 
 const EPOCH = new Date(0);
 
@@ -79,26 +80,37 @@ export async function oracleBase(
 	ids: string[],
 	steamIds: string[] | null = null
 ): Promise<Record<string, string | null>[]> {
+	return oracleRangeBase(db, ids, EPOCH, steamIds);
+}
+
+/** Every base row over these servers since `from`, each column as text. */
+export async function oracleRangeBase(
+	db: DbOrTx,
+	ids: string[],
+	from: Date,
+	steamIds: string[] | null = null
+): Promise<Record<string, string | null>[]> {
 	if (!ids.length) return [];
 	return (await db.execute(sql`
-		WITH ${base(ids, EPOCH, steamIds)}
+		WITH ${base(ids, from, steamIds)}
 		SELECT steam_id, minutes::text, seed_minutes::text, cash::text, last_seen::text, kills::text, deaths::text,
 		       headshots::text, team_kills::text, suicides::text, vehicle_kills::text, kill_streak::text,
 		       death_streak::text, matches::text, wins::text, losses::text, draws::text
 		  FROM base ORDER BY steam_id`)) as Record<string, string | null>[];
 }
 
-/** A slice of the all-time board as boardSlice read it, the counts as text. */
+/** A slice of the board since `from` (all time by default) as boardSlice read it, the counts as text. */
 export async function oracleBoard(
 	db: DbOrTx,
 	ids: string[],
 	q: BoardQuery,
 	limit: number,
-	offset: number
+	offset: number,
+	from: Date = EPOCH
 ): Promise<Record<string, unknown>[]> {
 	const order = q.dir === 'asc' ? sql`ASC NULLS LAST` : sql`DESC NULLS LAST`;
 	return (await db.execute(sql`
-		WITH ${base(ids, EPOCH)},
+		WITH ${base(ids, from)},
 		page AS (
 			SELECT *, COUNT(*) OVER () AS total FROM base
 			 WHERE minutes >= ${q.minMinutes}
@@ -158,6 +170,21 @@ export async function totalsRows(
 	if (!ids.length) return [];
 	return (await db.execute(sql`
 		WITH ${totalsBase(ids, steamIds)}
+		SELECT steam_id, minutes::text, seed_minutes::text, cash::text, last_seen::text, kills::text, deaths::text,
+		       headshots::text, team_kills::text, suicides::text, vehicle_kills::text, kill_streak::text,
+		       death_streak::text, matches::text, wins::text, losses::text, draws::text
+		  FROM base ORDER BY steam_id`)) as Record<string, string | null>[];
+}
+
+/** The same rows from the day rows (rangeBase), as text, to hold against oracleRangeBase. */
+export async function rangeRows(
+	db: DbOrTx,
+	ids: string[],
+	from: Date
+): Promise<Record<string, string | null>[]> {
+	if (!ids.length) return [];
+	return (await db.execute(sql`
+		WITH ${rangeBase(ids, from)}
 		SELECT steam_id, minutes::text, seed_minutes::text, cash::text, last_seen::text, kills::text, deaths::text,
 		       headshots::text, team_kills::text, suicides::text, vehicle_kills::text, kill_streak::text,
 		       death_streak::text, matches::text, wins::text, losses::text, draws::text

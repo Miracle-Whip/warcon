@@ -1,17 +1,23 @@
-// Each player's totals per server (player_totals, kept by the triggers of migration 0038) against
-// the all-time reads they replace, word for word (totals-oracle.ts). Seeded random histories run
-// through the worker's own looks at a scripted game on three servers (two in one organisation, one
-// in another): joins and returns, leaves past the grace, renames, side changes and the holding
-// side, counters that start again mid-match, cash, scores, match ends with a winner, a draw or no
-// score, abandoned matches after an outage, the offline transition and worker restarts; with
-// purges and direct writes in between (closed sessions inserted, edited and deleted, lines added to
-// an ended match, a winner changed, an ended match whose scores are not numbers). After every step
-// the all-time base rows of each set of servers are equal column by column, read in one
-// transaction (one now()); every tenth step and at the end the reads themselves are equal too
-// (every board metric both ways at two floors, every player's rank, the placeholders' stats, the
-// risk record), and a rebuild leaves the table as it was.
+// Each player's totals per server (player_totals, kept by the triggers of migration 0038) and per
+// server per UTC day (player_days, migration 0039) against the all-time and ranged reads they
+// replace, word for word (totals-oracle.ts). Seeded random histories run through the worker's own
+// looks at a scripted game on three servers (two in one organisation, one in another): joins and
+// returns, leaves past the grace, renames, side changes and the holding side, counters that start
+// again mid-match, cash, scores, match ends with a winner, a draw or no score, abandoned matches
+// after an outage, the offline transition and worker restarts; with purges and direct writes in
+// between (closed sessions inserted, edited, moved and deleted, lines added to an ended match, a
+// winner changed, a match's end moved, an ended match whose scores are not numbers). The clock
+// starts an hour before a UTC midnight and now and then moves on by hours or days with players on,
+// so sessions and matches cross midnights, some several. After every step the all-time base rows
+// of each set of servers are equal column by column, and so are the rows since a spread of
+// instants (the boards' own 7, 30 and 90 days back; midnights and a millisecond either side; a
+// join, a leave and a match end and a millisecond either side; random ones; before and after all
+// the data), all read in one transaction (one now()); every tenth step and at the end the reads
+// themselves are equal too (every board metric both ways at two floors for all time, and for each
+// range, every player's rank, the placeholders' stats, the risk record), and a rebuild leaves both
+// tables as they were.
 import { afterAll, beforeAll, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
-import { and, eq, isNotNull, sql } from 'drizzle-orm';
+import { and, eq, isNotNull, sql, type SQL } from 'drizzle-orm';
 import type { Env } from '$lib/server/env';
 import type { OrgRow, ServerRow } from '$lib/server/access';
 import {
@@ -35,10 +41,18 @@ import {
 	rankOf,
 	riskPerformanceFor
 } from '$lib/server/leaderboards';
-import { BOARD_METRICS, type BoardQuery } from '$lib/leaderboard';
+import { BOARD_METRICS, rangeStart, type BoardQuery } from '$lib/leaderboard';
 import { hasTestDb, testEnv } from './db';
 import { seedWorld, type World } from './world';
-import { oracleBase, oracleBoard, oracleRank, oracleRiskRecord, totalsRows } from './totals-oracle';
+import {
+	oracleBase,
+	oracleBoard,
+	oracleRangeBase,
+	oracleRank,
+	oracleRiskRecord,
+	rangeRows,
+	totalsRows
+} from './totals-oracle';
 
 const DEFAULT_SEED = 20261004;
 const SEED = Number(process.env.TOTALS_SEED ?? DEFAULT_SEED);
@@ -46,6 +60,11 @@ const STEPS = Number(process.env.TOTALS_STEPS ?? 120);
 const FACTIONS = ['Valkyra', 'Lonestar', 'White', null] as const;
 const MAPS = ['Kavkazi', 'Europe', 'Bakurani', 'Detroit'];
 const POOL = Array.from({ length: 24 }, (_, i) => `765611980000${String(31000 + i)}`);
+const HOUR = 3_600_000;
+const DAY = 86_400_000;
+/** The UTC midnight at or before t (epoch milliseconds count whole UTC days). */
+const midnight = (t: number) => Math.floor(t / DAY) * DAY;
+const ms = (v: unknown) => new Date(v as string | Date).getTime();
 
 /** mulberry32: the same history for the same seed. */
 function rng(seed: number) {
@@ -87,9 +106,14 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 	let env: Env;
 	let w: World;
 	let spy: ReturnType<typeof spyOn>;
-	let clock = Date.now() - 12 * 86_400_000;
+	// An hour before a UTC midnight twelve days back; the jumps never take the clock past a day ago.
+	const start = midnight(Date.now() - 12 * DAY) - HOUR;
+	const ceiling = Date.now() - DAY;
+	let clock = start;
 	const games = new Map<string, Game>();
 	const r = rng(SEED);
+	// The range starts the comparisons take, drawn on their own so they leave the history alone.
+	const pick = rng(SEED ^ 0x5eed);
 	let names = 0;
 
 	const json = (body: unknown) => ({
@@ -103,6 +127,15 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 		setSystemTime(new Date(clock));
 		expect(await acquireOrRenew(env, 'player-totals')).toBe(true);
 	};
+	/** Hours, now and then days, going by with whoever is on staying on (their sessions span it). */
+	const jump = () =>
+		Math.max(
+			60_000,
+			Math.min(
+				r.chance(0.15) ? (1 + r.int(2)) * DAY + r.int(DAY) : (1 + r.int(9)) * HOUR,
+				ceiling - clock
+			)
+		);
 	const look = async (g: Game) => {
 		g.m.playersIntervalMs = 120_000;
 		await observeServer(env, g.m, { status: true, players: true });
@@ -194,7 +227,7 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 	/** A write that is not the worker's: a hand repair, a backfill, a test fixture. */
 	const direct = async (g: Game) => {
 		const at = new Date(clock - r.int(5) * 86_400_000 - r.int(3_600_000));
-		switch (r.int(7)) {
+		switch (r.int(10)) {
 			case 0: {
 				const left = new Date(at.getTime() + 60_000 + r.int(7_200_000));
 				await env.db.insert(playerSessions).values({
@@ -319,6 +352,62 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 				);
 				return;
 			}
+			case 7: {
+				// a closed session over one or two midnights, written by hand
+				const left = new Date(at.getTime() + 20 * HOUR + r.int(30 * HOUR));
+				await env.db.insert(playerSessions).values({
+					serverId: g.server.id,
+					steamId: r.pick(POOL),
+					name: newName(r.pick(POOL)),
+					faction: 'Lonestar',
+					joinedAt: at,
+					lastSeen: left,
+					leftAt: left,
+					kills: r.int(30),
+					deaths: r.int(30),
+					cash: r.int(5000),
+					seedSeconds: r.int(600)
+				});
+				return;
+			}
+			case 8: {
+				// a closed session moved by hours, often across a midnight (last seen moves with it)
+				const [row] = await env.db
+					.select({
+						id: playerSessions.id,
+						joinedAt: playerSessions.joinedAt,
+						leftAt: playerSessions.leftAt
+					})
+					.from(playerSessions)
+					.where(and(eq(playerSessions.serverId, g.server.id), isNotNull(playerSessions.leftAt)))
+					.limit(1)
+					.offset(r.int(20));
+				const by = (r.chance(0.5) ? -1 : 1) * (1 + r.int(30)) * HOUR;
+				if (row) {
+					const left = new Date(row.leftAt!.getTime() + by);
+					await env.db
+						.update(playerSessions)
+						.set({ joinedAt: new Date(row.joinedAt.getTime() + by), leftAt: left, lastSeen: left })
+						.where(eq(playerSessions.id, row.id));
+				}
+				return;
+			}
+			case 9: {
+				// an ended match's end moved by hours, often to another day
+				const [m] = await env.db
+					.select({ id: matches.id, endedAt: matches.endedAt })
+					.from(matches)
+					.where(and(eq(matches.serverId, g.server.id), isNotNull(matches.endedAt)))
+					.limit(1)
+					.offset(r.int(5));
+				const by = (r.chance(0.5) ? -1 : 1) * (1 + r.int(30)) * HOUR;
+				if (m)
+					await env.db
+						.update(matches)
+						.set({ endedAt: new Date(m.endedAt!.getTime() + by) })
+						.where(eq(matches.id, m.id));
+				return;
+			}
 		}
 	};
 
@@ -339,51 +428,105 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 		});
 	};
 
+	/**
+	 * Range starts worth holding the day rows to: the boards' own; a midnight and a millisecond
+	 * either side; a join, a leave, a match end and an open session's join, each a millisecond
+	 * either side; random instants; before and after all the data.
+	 */
+	const instants = async (ids: string[], every: boolean): Promise<number[]> => {
+		const span = clock - start + 2 * DAY;
+		const anywhere = () => start - DAY + Math.floor(pick.next() * span);
+		const m = midnight(anywhere());
+		const out = [clock - 7 * DAY, clock - 30 * DAY, clock - 90 * DAY, start - 2 * DAY, clock + DAY];
+		out.push(m - 1, m, m + 1, midnight(clock));
+		for (let i = 0; i < (every ? 6 : 2); i++) out.push(anywhere());
+		const one = async (q: SQL) => ((await env.db.execute(q)) as { t: unknown }[])[0]?.t;
+		const edges = [
+			await one(sql`SELECT joined_at AS t FROM player_sessions WHERE server_id IN ${ids}
+			               AND left_at IS NOT NULL ORDER BY id OFFSET ${pick.int(40)} LIMIT 1`),
+			await one(sql`SELECT left_at AS t FROM player_sessions WHERE server_id IN ${ids}
+			               AND left_at IS NOT NULL ORDER BY id OFFSET ${pick.int(40)} LIMIT 1`),
+			await one(sql`SELECT ended_at AS t FROM matches WHERE server_id IN ${ids}
+			               AND ended_at IS NOT NULL ORDER BY id OFFSET ${pick.int(20)} LIMIT 1`),
+			await one(sql`SELECT joined_at AS t FROM player_sessions WHERE server_id IN ${ids}
+			               AND left_at IS NULL ORDER BY id OFFSET ${pick.int(10)} LIMIT 1`)
+		];
+		for (const e of edges) if (e) out.push(ms(e) - 1, ms(e), ms(e) + 1);
+		return out;
+	};
+	/** The rows since each of those instants, equal column by column, in one transaction. */
+	const compareRanges = async (step: string, every: boolean) => {
+		const plan: [string[], number[]][] = [];
+		for (const ids of sets()) plan.push([ids, await instants(ids, every)]);
+		await env.db.transaction(async (tx) => {
+			for (const [ids, ts] of plan)
+				for (const t of ts) {
+					const from = new Date(t);
+					const since = from.toISOString();
+					expect({ step, ids, since, rows: await rangeRows(tx, ids, from) }).toEqual({
+						step,
+						ids,
+						since,
+						rows: await oracleRangeBase(tx, ids, from)
+					});
+				}
+		});
+	};
+
 	/** The reads themselves: boards, ranks, placeholders' stats and the risk record. */
 	const compareReads = async (step: string) => {
 		await env.db.transaction(async (tx) => {
 			const e = { ...env, db: tx } as unknown as Env;
 			for (const ids of sets()) {
 				const players = (await oracleBase(tx, ids)).map((b) => b.steam_id as string);
+				// all time: every metric both ways at both floors; each range: every metric at the
+				// default floor, and one more each way round
+				const boards: BoardQuery[] = [];
+				const board = (
+					range: BoardQuery['range'],
+					sort: BoardQuery['sort'],
+					dir: BoardQuery['dir'],
+					minMinutes: number
+				) => boards.push({ scope: 'server', range, sort, dir, page: 1, minMinutes });
 				for (const metric of BOARD_METRICS)
 					for (const dir of ['desc', 'asc'] as const)
-						for (const minMinutes of [0, 60]) {
-							const q: BoardQuery = {
-								scope: 'server',
-								range: 'all',
-								sort: metric.key,
-								dir,
-								page: 1,
-								minMinutes
-							};
-							const want = (await oracleBoard(tx, ids, q, EXPORT_ROWS, 0)).map((o, i) => ({
-								rank: i + 1,
-								steamId: o.steamId as string,
-								name: ((o.name as string | null) || o.steamId) as string,
-								minutes: Math.round(Number(o.minutes)),
-								seedMinutes: Math.round(Number(o.seedMinutes)),
-								kills: Number(o.kills),
-								deaths: Number(o.deaths),
-								headshots: Number(o.headshots),
-								teamKills: Number(o.teamKills),
-								suicides: Number(o.suicides),
-								vehicleKills: Number(o.vehicleKills),
-								killStreak: Number(o.killStreak),
-								deathStreak: Number(o.deathStreak),
-								matches: Number(o.matches),
-								wins: Number(o.wins),
-								losses: Number(o.losses),
-								draws: Number(o.draws),
-								cash: Number(o.cash),
-								lastSeen: o.lastSeen ? new Date(o.lastSeen as string).toISOString() : null
-							}));
-							expect({ step, ids, q, rows: await exportBoard(e, ids, q) }).toEqual({
-								step,
-								ids,
-								q,
-								rows: want
-							});
-						}
+						for (const minMinutes of [0, 60]) board('all', metric.key, dir, minMinutes);
+				for (const range of ['7d', '30d', '90d'] as const) {
+					for (const metric of BOARD_METRICS) board(range, metric.key, 'desc', 60);
+					board(range, BOARD_METRICS[pick.int(BOARD_METRICS.length)].key, 'asc', 60);
+					board(range, BOARD_METRICS[pick.int(BOARD_METRICS.length)].key, 'desc', 0);
+				}
+				for (const q of boards) {
+					// the range starts where exportBoard's does: the clock is frozen
+					const from = rangeStart(q.range) ?? undefined;
+					const want = (await oracleBoard(tx, ids, q, EXPORT_ROWS, 0, from)).map((o, i) => ({
+						rank: i + 1,
+						steamId: o.steamId as string,
+						name: ((o.name as string | null) || o.steamId) as string,
+						minutes: Math.round(Number(o.minutes)),
+						seedMinutes: Math.round(Number(o.seedMinutes)),
+						kills: Number(o.kills),
+						deaths: Number(o.deaths),
+						headshots: Number(o.headshots),
+						teamKills: Number(o.teamKills),
+						suicides: Number(o.suicides),
+						vehicleKills: Number(o.vehicleKills),
+						killStreak: Number(o.killStreak),
+						deathStreak: Number(o.deathStreak),
+						matches: Number(o.matches),
+						wins: Number(o.wins),
+						losses: Number(o.losses),
+						draws: Number(o.draws),
+						cash: Number(o.cash),
+						lastSeen: o.lastSeen ? new Date(o.lastSeen as string).toISOString() : null
+					}));
+					expect({ step, ids, q, rows: await exportBoard(e, ids, q) }).toEqual({
+						step,
+						ids,
+						q,
+						rows: want
+					});
+				}
 				for (const p of players)
 					expect({ step, ids, p, rank: await rankOf(e, ids, p) }).toEqual({
 						step,
@@ -442,6 +585,17 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 		(await env.db.execute(sql`
 			SELECT t::text AS row FROM player_totals t
 			 WHERE server_id IN ${sets()[4]} ORDER BY server_id, steam_id`)) as { row: string }[];
+	/** The day rows, each crossing list in order (the adds append, a rebuild lists them sorted). */
+	const dayTable = async () =>
+		(await env.db.execute(sql`
+			SELECT (d.server_id, d.day, d.steam_id, d.seconds,
+			        (SELECT array_agg(c ORDER BY c) FROM unnest(d.crossings) c),
+			        d.sessions, d.seed_seconds, d.cash, d.last_seen, d.matches, d.kills, d.deaths, d.headshots,
+			        d.team_kills, d.suicides, d.vehicle_kills, d.kill_streak, d.death_streak, d.wins,
+			        d.losses, d.draws)::text AS row
+			  FROM player_days d WHERE server_id IN ${sets()[4]} ORDER BY server_id, day, steam_id`)) as {
+			row: string;
+		}[];
 
 	beforeAll(async () => {
 		env = { ...(await testEnv()), STEAM_API_KEY: '' };
@@ -537,7 +691,7 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 	test(`${STEPS} steps of play, outages, restarts, purges and hand edits (seed ${SEED})`, async () => {
 		for (let step = 1; step <= STEPS; step++) {
 			const label = `seed ${SEED} step ${step}`;
-			await tick(5_000 + r.int(90_000));
+			await tick(r.chance(0.06) ? jump() : 5_000 + r.int(90_000));
 			for (const g of games.values()) {
 				play(g);
 				if (r.chance(0.02)) restart(g);
@@ -550,6 +704,7 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 				await purgeServerStats(env, new Request('http://localhost/test'), w.users.owner!, g.server);
 			}
 			await compareBase(label);
+			await compareRanges(label, step % 10 === 0);
 			if (step % 10 === 0) await compareReads(label);
 		}
 		// Everyone leaves; the last sessions close and their matches stay open.
@@ -559,37 +714,75 @@ describe.skipIf(!hasTestDb)('player totals against the reads they replace', () =
 		await tick(70_000);
 		for (const g of games.values()) await look(g);
 		await compareBase(`seed ${SEED} end`);
+		await compareRanges(`seed ${SEED} end`, true);
 		await compareReads(`seed ${SEED} end`);
 		const before = await table();
+		const beforeDays = await dayTable();
 		await env.db.execute(sql`SELECT player_totals_rebuild()`);
 		expect(await table()).toEqual(before);
+		expect(await dayTable()).toEqual(beforeDays);
 		// The default history (the one CI runs) reaches every path the totals have: closes with seed
-		// time and cash, match ends with the feed's columns, hand edits. Other seeds explore.
-		if (SEED !== DEFAULT_SEED) return;
-		const [counts] = (await env.db.execute(sql`
-			SELECT (SELECT COUNT(*) FROM player_sessions WHERE server_id IN ${sets()[4]} AND left_at IS NOT NULL)::int AS closed,
-			       (SELECT COUNT(*) FROM matches WHERE server_id IN ${sets()[4]} AND ended_at IS NOT NULL)::int AS ended,
-			       (SELECT COUNT(*) FROM match_players WHERE server_id IN ${sets()[4]})::int AS lines`)) as {
-			closed: number;
-			ended: number;
-			lines: number;
-		}[];
-		expect(counts.closed).toBeGreaterThan(50);
-		expect(counts.ended).toBeGreaterThan(10);
-		expect(counts.lines).toBeGreaterThan(50);
-		const [seeded] = (await env.db.execute(sql`
-			SELECT COUNT(*)::int AS n FROM player_sessions
-			 WHERE server_id = ${w.server.id} AND left_at IS NOT NULL AND seed_seconds > 0`)) as {
-			n: number;
-		}[];
-		expect(seeded.n).toBeGreaterThan(5);
-		const [fed] = (await env.db.execute(sql`
-			SELECT COUNT(*)::int AS n FROM match_players p JOIN matches m ON m.id = p.match_id
-			 WHERE p.server_id = ${w.otherServer.id} AND m.ended_at IS NOT NULL AND p.kill_streak > 1`)) as {
-			n: number;
-		}[];
-		expect(fed.n).toBeGreaterThan(5);
-	}, 600_000);
+		// time and cash, match ends with the feed's columns, hand edits, midnights. Other seeds explore.
+		if (SEED === DEFAULT_SEED) {
+			const [counts] = (await env.db.execute(sql`
+				SELECT (SELECT COUNT(*) FROM player_sessions WHERE server_id IN ${sets()[4]} AND left_at IS NOT NULL)::int AS closed,
+				       (SELECT COUNT(*) FROM matches WHERE server_id IN ${sets()[4]} AND ended_at IS NOT NULL)::int AS ended,
+				       (SELECT COUNT(*) FROM match_players WHERE server_id IN ${sets()[4]})::int AS lines`)) as {
+				closed: number;
+				ended: number;
+				lines: number;
+			}[];
+			expect(counts.closed).toBeGreaterThan(50);
+			expect(counts.ended).toBeGreaterThan(10);
+			expect(counts.lines).toBeGreaterThan(50);
+			const [seeded] = (await env.db.execute(sql`
+				SELECT COUNT(*)::int AS n FROM player_sessions
+				 WHERE server_id = ${w.server.id} AND left_at IS NOT NULL AND seed_seconds > 0`)) as {
+				n: number;
+			}[];
+			expect(seeded.n).toBeGreaterThan(5);
+			const [fed] = (await env.db.execute(sql`
+				SELECT COUNT(*)::int AS n FROM match_players p JOIN matches m ON m.id = p.match_id
+				 WHERE p.server_id = ${w.otherServer.id} AND m.ended_at IS NOT NULL AND p.kill_streak > 1`)) as {
+				n: number;
+			}[];
+			expect(fed.n).toBeGreaterThan(5);
+			// and crosses midnights: closed sessions over one and over two or more, match ends on
+			// several days, day rows holding crossings
+			const [days] = (await env.db.execute(sql`
+				WITH s AS (
+					SELECT (left_at AT TIME ZONE 'UTC')::date - (joined_at AT TIME ZONE 'UTC')::date AS spans
+					  FROM player_sessions WHERE server_id IN ${sets()[4]} AND left_at IS NOT NULL)
+				SELECT (SELECT COUNT(*) FROM s WHERE spans = 1)::int AS one,
+				       (SELECT COUNT(*) FROM s WHERE spans >= 2)::int AS several,
+				       (SELECT COUNT(DISTINCT (ended_at AT TIME ZONE 'UTC')::date) FROM matches
+				         WHERE server_id IN ${sets()[4]} AND ended_at IS NOT NULL)::int AS end_days,
+				       (SELECT COUNT(*) FROM player_days WHERE server_id IN ${sets()[4]}
+				         AND crossings IS NOT NULL)::int AS crossing_rows`)) as {
+				one: number;
+				several: number;
+				end_days: number;
+				crossing_rows: number;
+			}[];
+			expect(days.one).toBeGreaterThan(2);
+			expect(days.several).toBeGreaterThan(5);
+			expect(days.end_days).toBeGreaterThan(2);
+			expect(days.crossing_rows).toBeGreaterThan(10);
+		}
+		// A purge of the server with the most history, then the same checks, and a rebuild that
+		// leaves the day rows as the purge did (no row emptied of its lines left behind).
+		await purgeServerStats(
+			env,
+			new Request('http://localhost/test'),
+			w.users.owner!,
+			games.get(w.server.id)!.server
+		);
+		await compareBase(`seed ${SEED} after a purge`);
+		await compareRanges(`seed ${SEED} after a purge`, true);
+		const purged = await dayTable();
+		await env.db.execute(sql`SELECT player_totals_rebuild()`);
+		expect(await dayTable()).toEqual(purged);
+	}, 900_000);
 
 	/** Somebody waits for a server's totals lock. */
 	const untilWaiting = async () => {

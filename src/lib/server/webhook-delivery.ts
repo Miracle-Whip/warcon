@@ -8,6 +8,7 @@ import { decryptSecret } from './crypto';
 import { playerMarks, servers, webhooks, type AuditRow, type WebhookRow } from './db/schema';
 import { OWNERS_ROWS } from './audit-rows';
 import { escapeMarkdown } from './webhook-status-core';
+import { KILL_DISTANCE_SKIP } from './kill-distance';
 import { causeLabel } from '$lib/causes';
 import type { KillView } from '$lib/types';
 
@@ -468,13 +469,19 @@ export async function recordResult(env: Env, id: string, result: PostResult): Pr
  * rule's card out of the webhook's queue.
  */
 const QUIET_WHEN_OK = new Set(['trigger.two_teams', 'trigger.afk_protection']);
+/** A delivery that only notes what a rule saw and let be: the audit trail keeps it, Discord does not. */
+const NOTES = new Set([KILL_DISTANCE_SKIP]);
+const isNote = (row: AuditRow): boolean => {
+	const action = (row.detail as { rconAction?: unknown } | null)?.rconAction;
+	return typeof action === 'string' && NOTES.has(action);
+};
 
 /** Fans one audit row out to the org's webhooks that want its event class. Never throws. */
 export async function notifyWebhooks(env: Env, row: AuditRow): Promise<void> {
 	try {
 		const event = classify(row);
 		if (!event) return;
-		if (row.outcome === 'ok' && QUIET_WHEN_OK.has(row.action)) return;
+		if (row.outcome === 'ok' && (QUIET_WHEN_OK.has(row.action) || isNote(row))) return;
 		const orgId = row.orgId ?? (row.serverId ? await orgOfServer(env, row.serverId) : null);
 		if (!orgId) return;
 		const hooks = await enabledWebhooks(env, orgId);

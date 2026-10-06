@@ -4,7 +4,8 @@
 // for the result, and the sessions for playtime, seed time, the last name and cash. All time is
 // read from each player's settled totals per server (player_totals, kept by the database as
 // sessions close and matches end, migration 0038) plus the open sessions; a range (7, 30, 90
-// days) sums the sources in it. A page of a board is kept for a minute (loadBoard). Only matches
+// days) from the same totals per UTC day (player_days, migration 0039) plus its partial first day
+// and the open sessions. A page of a board is kept for a minute (loadBoard). Only matches
 // that have ended count, and a match is in a range by when it ended; the match in progress is on
 // the live page. The result of a match for a player (win, loss, draw, none) is the rule in
 // $lib/leaderboard, written out again in SQL below for the aggregates (and once more, as
@@ -12,6 +13,7 @@
 import { sql } from 'drizzle-orm';
 import type { Env } from './env';
 import { servers } from './db/schema';
+import { boardReads } from './metrics';
 import type { RiskPerformance } from './risk';
 import type { PlayerStats } from './message-vars';
 import {
@@ -61,47 +63,72 @@ const lines = (ids: string[], from: Date, steamId: string | string[] | null) => 
 		   ${steamId === null ? sql`` : Array.isArray(steamId) ? sql`AND p.steam_id IN ${steamId}` : sql`AND p.steam_id = ${steamId}`})`;
 
 /**
- * Per-player totals over these servers since `from`: playtime, seed time, the last look and
- * cash summed over sessions; matches, results, kills, deaths and the feed's columns from
- * the match lines; joined on the SteamID, so a player seen by one source only still gets a row.
- * `steamIds` narrows it to those players, with the same totals.
+ * Per-player totals over these servers since `from` (the 7, 30 and 90-day boards), from the day
+ * rows (player_days, migration 0039): every UTC day after from's (D1 on) in full; for each session
+ * that crossed D1's midnight (its join is kept on D1's row), its time from `from`, or from its
+ * join, to that midnight; and, read here, the sessions closed between `from` and that midnight, the
+ * open sessions seen since `from` and the lines of matches that ended in the same stretch. One pass
+ * over them, then the columns of the reads before player_days (base in src/test/totals-oracle.ts),
+ * word for word: a player's session side only when they have a session in range, the line side
+ * only with a line in range, else the zero the missing side had. Seconds are exact numeric sums,
+ * so the minutes are the same digits for any `from`. Also read by the exactness test.
  */
-const base = (ids: string[], from: Date, steamIds: string[] | null = null) => sql`
-	sess AS (
-		SELECT steam_id,
-		       SUM(EXTRACT(EPOCH FROM (COALESCE(left_at, now()) - GREATEST(joined_at, ${from}::timestamptz)))) / 60 AS minutes,
-		       SUM(seed_seconds) / 60.0 AS seed_minutes, MAX(last_seen) AS last_seen,
-		       SUM(cash) AS cash
-		  FROM player_sessions WHERE server_id IN ${ids} AND last_seen >= ${from}
-		   AND (left_at IS NULL OR left_at >= ${from})
-		   ${steamIds === null ? sql`` : sql`AND steam_id IN ${steamIds}`}
-		 GROUP BY steam_id),
-	${lines(ids, from, steamIds)},
-	mt AS (
-		SELECT steam_id, COUNT(*) AS matches,
-		       SUM(kills) AS kills, SUM(deaths) AS deaths, SUM(headshots) AS headshots,
+export const rangeBase = (ids: string[], from: Date) => sql`
+	edge AS (
+		SELECT ${from}::timestamptz AS f, (${from}::timestamptz AT TIME ZONE 'UTC')::date + 1 AS d1,
+		       ((${from}::timestamptz AT TIME ZONE 'UTC')::date + 1)::timestamp AT TIME ZONE 'UTC' AS m1),
+	parts AS (
+		SELECT d.steam_id, d.sessions AS n, d.seconds AS sec, d.seed_seconds AS seed, d.cash, d.last_seen AS ls,
+		       d.matches AS m, d.kills, d.deaths, d.headshots, d.team_kills, d.suicides, d.vehicle_kills,
+		       d.kill_streak, d.death_streak, d.wins, d.losses, d.draws
+		  FROM player_days d, edge WHERE d.server_id IN ${ids} AND d.day >= edge.d1
+		UNION ALL
+		SELECT d.steam_id, 0, EXTRACT(EPOCH FROM (edge.m1 - GREATEST(j, edge.f))), 0, 0, NULL,
+		       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+		  FROM player_days d CROSS JOIN edge CROSS JOIN LATERAL unnest(d.crossings) j
+		 WHERE d.server_id IN ${ids} AND d.day = edge.d1 AND d.crossings IS NOT NULL
+		UNION ALL
+		SELECT s.steam_id, 1, EXTRACT(EPOCH FROM (COALESCE(s.left_at, now()) - GREATEST(s.joined_at, edge.f))),
+		       s.seed_seconds, s.cash, s.last_seen, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+		  FROM player_sessions s, edge
+		 WHERE s.server_id IN ${ids} AND s.last_seen >= edge.f
+		   AND (s.left_at IS NULL OR (s.left_at >= edge.f AND s.left_at < edge.m1))
+		UNION ALL
+		SELECT p.steam_id, 0, 0, 0, 0, NULL, 1, p.kills, p.deaths, p.headshots, p.team_kills, p.suicides,
+		       p.vehicle_kills, p.kill_streak, p.death_streak, CASE WHEN x.r = 'win' THEN 1 ELSE 0 END,
+		       CASE WHEN x.r = 'loss' THEN 1 ELSE 0 END, CASE WHEN x.r = 'draw' THEN 1 ELSE 0 END
+		  FROM edge, matches mt
+		  JOIN match_players p ON p.match_id = mt.id AND p.server_id = mt.server_id
+		  CROSS JOIN LATERAL (SELECT match_result(mt.final_scores, mt.winner, p.faction) AS r) x
+		 WHERE mt.server_id IN ${ids} AND mt.ended_at >= edge.f AND mt.ended_at < edge.m1),
+	player AS (
+		SELECT steam_id, SUM(n) AS n, SUM(sec) AS sec, SUM(seed) AS seed, MAX(ls) AS ls, SUM(cash) AS cash,
+		       SUM(m) AS m, SUM(kills) AS kills, SUM(deaths) AS deaths, SUM(headshots) AS headshots,
 		       SUM(team_kills) AS team_kills, SUM(suicides) AS suicides, SUM(vehicle_kills) AS vehicle_kills,
-		       MAX(kill_streak) AS kill_streak, MAX(death_streak) AS death_streak,
-		       COUNT(*) FILTER (WHERE result = 'win') AS wins,
-		       COUNT(*) FILTER (WHERE result = 'loss') AS losses,
-		       COUNT(*) FILTER (WHERE result = 'draw') AS draws
-		  FROM lines GROUP BY steam_id),
+		       MAX(kill_streak) FILTER (WHERE m > 0) AS kill_streak,
+		       MAX(death_streak) FILTER (WHERE m > 0) AS death_streak,
+		       SUM(wins) AS wins, SUM(losses) AS losses, SUM(draws) AS draws
+		  FROM parts GROUP BY steam_id HAVING SUM(n) > 0 OR SUM(m) > 0),
 	base AS (
 		SELECT steam_id,
-		       COALESCE(sess.minutes, 0) AS minutes, COALESCE(sess.seed_minutes, 0) AS seed_minutes,
-		       COALESCE(sess.cash, 0) AS cash, sess.last_seen,
-		       COALESCE(mt.kills, 0) AS kills, COALESCE(mt.deaths, 0) AS deaths,
-		       COALESCE(mt.headshots, 0) AS headshots, COALESCE(mt.team_kills, 0) AS team_kills,
-		       COALESCE(mt.suicides, 0) AS suicides, COALESCE(mt.vehicle_kills, 0) AS vehicle_kills,
-		       COALESCE(mt.kill_streak, 0) AS kill_streak, COALESCE(mt.death_streak, 0) AS death_streak,
-		       COALESCE(mt.matches, 0) AS matches, COALESCE(mt.wins, 0) AS wins,
-		       COALESCE(mt.losses, 0) AS losses, COALESCE(mt.draws, 0) AS draws
-		  FROM sess FULL JOIN mt USING (steam_id))`;
+		       CASE WHEN n > 0 THEN sec / 60 ELSE 0 END AS minutes,
+		       CASE WHEN n > 0 THEN seed / 60.0 ELSE 0 END AS seed_minutes,
+		       CASE WHEN n > 0 THEN cash ELSE 0 END AS cash, CASE WHEN n > 0 THEN ls END AS last_seen,
+		       CASE WHEN m > 0 THEN kills ELSE 0 END AS kills, CASE WHEN m > 0 THEN deaths ELSE 0 END AS deaths,
+		       CASE WHEN m > 0 THEN headshots ELSE 0 END AS headshots,
+		       CASE WHEN m > 0 THEN team_kills ELSE 0 END AS team_kills,
+		       CASE WHEN m > 0 THEN suicides ELSE 0 END AS suicides,
+		       CASE WHEN m > 0 THEN vehicle_kills ELSE 0 END AS vehicle_kills,
+		       CASE WHEN m > 0 THEN kill_streak ELSE 0 END AS kill_streak,
+		       CASE WHEN m > 0 THEN death_streak ELSE 0 END AS death_streak,
+		       CASE WHEN m > 0 THEN m ELSE 0 END AS matches, CASE WHEN m > 0 THEN wins ELSE 0 END AS wins,
+		       CASE WHEN m > 0 THEN losses ELSE 0 END AS losses, CASE WHEN m > 0 THEN draws ELSE 0 END AS draws
+		  FROM player)`;
 
 /**
- * `base` for all time, from the settled totals: `sess` is the pairs with a closed session plus
- * the open sessions, `mt` the pairs with a line of an ended match, then the same join. The same
- * rows and values as base(ids, EPOCH, steamIds): the seconds are exact numeric sums either way,
+ * The base rows for all time, from the settled totals: `sess` is the pairs with a closed session
+ * plus the open sessions, `mt` the pairs with a line of an ended match, then the join of the reads
+ * before player_totals. The same rows and values as they gave: the seconds are exact numeric sums,
  * and a player with no session at all still gets the join's zeros. Also read by the exactness
  * test (src/test/player-totals.test.ts).
  */
@@ -263,7 +290,7 @@ async function boardSlice(
 	const from = rangeStart(q.range);
 	const order = q.dir === 'asc' ? sql`ASC NULLS LAST` : sql`DESC NULLS LAST`;
 	return (await env.db.execute<BaseRow>(sql`
-		WITH ${from ? base(ids, from) : totalsBase(ids)},
+		WITH ${from ? rangeBase(ids, from) : totalsBase(ids)},
 		page AS (
 			SELECT *, COUNT(*) OVER () AS total FROM base
 			 WHERE minutes >= ${q.minMinutes}
@@ -288,7 +315,10 @@ async function boardSlice(
 const BOARD_TTL_MS = 60_000;
 /** The most pages kept: fifty rows each, a few megabytes at most. */
 const BOARD_CACHE_MAX = 500;
-const boardCache = new Map<string, { ids: string[]; until: number; view: Promise<BoardView> }>();
+const boardCache = new Map<
+	string,
+	{ ids: string[]; until: number; view: Promise<BoardView>; read: boolean }
+>();
 
 /** Forgets the boards kept over this server (its stats were purged), or every board. */
 export function forgetBoards(serverId?: string): void {
@@ -303,14 +333,26 @@ export async function loadBoard(env: Env, ids: string[], q: BoardQuery): Promise
 	const key = JSON.stringify([sorted, q.scope, q.range, q.sort, q.dir, q.page, q.minMinutes]);
 	const now = Date.now();
 	const hit = boardCache.get(key);
-	if (hit && hit.until > now) return hit.view;
-	const entry = { ids: sorted, until: now + BOARD_TTL_MS, view: readBoard(env, sorted, q) };
+	if (hit && hit.until > now) {
+		boardReads.inc({ outcome: hit.read ? 'hit' : 'shared' });
+		return hit.view;
+	}
+	boardReads.inc({ outcome: 'miss' });
+	const entry = {
+		ids: sorted,
+		until: now + BOARD_TTL_MS,
+		view: readBoard(env, sorted, q),
+		read: false
+	};
 	boardCache.delete(key);
 	boardCache.set(key, entry);
 	// A failed read is not kept: the next request reads again.
-	entry.view.catch(() => {
-		if (boardCache.get(key) === entry) boardCache.delete(key);
-	});
+	entry.view.then(
+		() => (entry.read = true),
+		() => {
+			if (boardCache.get(key) === entry) boardCache.delete(key);
+		}
+	);
 	if (boardCache.size > BOARD_CACHE_MAX) {
 		for (const [k, e] of boardCache) if (e.until <= now) boardCache.delete(k);
 		for (const k of boardCache.keys()) {
