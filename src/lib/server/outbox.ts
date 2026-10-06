@@ -32,7 +32,7 @@ import { gateway } from './gateway';
 import { deliveries } from './metrics';
 import { NAME_FLAG } from './name-filter';
 import { KILL_RATE_FLAG } from './kill-rate';
-import { KILL_DISTANCE_FLAG } from './kill-distance';
+import { KILL_DISTANCE_FLAG, KILL_DISTANCE_SKIP } from './kill-distance';
 import { writeAudit } from './audit';
 import { PANEL_BAN, type PanelBanParams } from './rule-ban';
 import { killAndTell, RULE_KILL, RULE_KILL_MAX_AGE_MS } from './rule-kill';
@@ -53,7 +53,8 @@ const PANEL_ACTIONS = new Set([
 	PANEL_BAN,
 	NAME_FLAG,
 	KILL_RATE_FLAG,
-	KILL_DISTANCE_FLAG
+	KILL_DISTANCE_FLAG,
+	KILL_DISTANCE_SKIP
 ]);
 
 /** The most rows one claim takes, oldest first. */
@@ -470,12 +471,14 @@ async function release(env: Env, row: OutboxRow): Promise<void> {
 async function deliverOne(env: Env, row: OutboxRow): Promise<'held' | 'refused' | void> {
 	if (row.action === 'seed_reward') return deliverSeedReward(env, row);
 	if (row.action === PANEL_BAN) return deliverPanelBan(env, row);
-	// An alert-only Name filter match or a Kill rate or Kill distance flag: the audit row (and its
-	// Discord card) is the whole delivery.
+	// An alert-only Name filter match, a Kill rate or Kill distance flag, or a Kill distance rule's
+	// note of a kill it left out: the audit row (and, but for the note, its Discord card) is the
+	// whole delivery.
 	if (
 		row.action === NAME_FLAG ||
 		row.action === KILL_RATE_FLAG ||
-		row.action === KILL_DISTANCE_FLAG
+		row.action === KILL_DISTANCE_FLAG ||
+		row.action === KILL_DISTANCE_SKIP
 	) {
 		const holds = await stillHolds(env, row);
 		if (holds === null) return release(env, row);

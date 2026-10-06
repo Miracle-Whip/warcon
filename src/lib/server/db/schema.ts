@@ -6,6 +6,7 @@ import {
 	bigserial,
 	boolean,
 	customType,
+	date,
 	index,
 	integer,
 	numeric,
@@ -487,7 +488,9 @@ export const matches = pgTable(
 		/** the match in progress, which every status look and kill batch reads: one entry per server */
 		index('matches_open_idx')
 			.on(t.serverId, t.id)
-			.where(sql`${t.endedAt} is null`)
+			.where(sql`${t.endedAt} is null`),
+		/** the matches that ended in a range's first, partial day (rangeBase) */
+		index('matches_server_ended_idx').on(t.serverId, t.endedAt)
 	]
 );
 
@@ -618,6 +621,49 @@ export const playerTotals = pgTable(
 		draws: integer('draws').notNull().default(0)
 	},
 	(t) => [primaryKey({ columns: [t.serverId, t.steamId] })]
+);
+
+/**
+ * Each player's settled totals on a server per UTC day, for the ranged boards (7, 30 and 90 days),
+ * which add the range's partial first day and the open sessions (rangeBase): the closed sessions'
+ * time within the day, the joined_at of each closed session that crossed the day's midnight (what
+ * a range starting the day before needs), and the count, seed time, cash and last sighting of the
+ * sessions that left on the day; the lines of the matches that ended on it, with the boards' result
+ * rule. A row exists while it holds any of them. Kept by the same triggers and lock as
+ * player_totals (migration 0039 extends 0038's); the application only reads it.
+ */
+export const playerDays = pgTable(
+	'player_days',
+	{
+		serverId: text('server_id').notNull(),
+		/** the UTC date */
+		day: date('day', { mode: 'string' }).notNull(),
+		steamId: text('steam_id').notNull(),
+		/** the closed sessions' seconds within the day, exact */
+		seconds: numeric('seconds').notNull().default('0'),
+		/** joined_at of each closed session that started before the day and left on it or later, in order; null when none */
+		crossings: ts('crossings').array(),
+		/** closed sessions that left on the day */
+		sessions: integer('sessions').notNull().default(0),
+		seedSeconds: bigint('seed_seconds', { mode: 'number' }).notNull().default(0),
+		cash: bigint('cash', { mode: 'number' }).notNull().default(0),
+		/** MAX(last_seen) over them; null without one */
+		lastSeen: ts('last_seen'),
+		/** lines of matches that ended on the day */
+		matches: integer('matches').notNull().default(0),
+		kills: bigint('kills', { mode: 'number' }).notNull().default(0),
+		deaths: bigint('deaths', { mode: 'number' }).notNull().default(0),
+		headshots: bigint('headshots', { mode: 'number' }).notNull().default(0),
+		teamKills: bigint('team_kills', { mode: 'number' }).notNull().default(0),
+		suicides: bigint('suicides', { mode: 'number' }).notNull().default(0),
+		vehicleKills: bigint('vehicle_kills', { mode: 'number' }).notNull().default(0),
+		killStreak: integer('kill_streak').notNull().default(0),
+		deathStreak: integer('death_streak').notNull().default(0),
+		wins: integer('wins').notNull().default(0),
+		losses: integer('losses').notNull().default(0),
+		draws: integer('draws').notNull().default(0)
+	},
+	(t) => [primaryKey({ columns: [t.serverId, t.day, t.steamId] })]
 );
 
 // ---- Player intelligence: org-scoped notes and watchlist, cached Steam data, ban snapshots ------

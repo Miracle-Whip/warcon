@@ -115,6 +115,7 @@ import {
 	killDistanceReplay,
 	killDistanceSettingsKey,
 	killDistanceVerdict,
+	killsAfterDeathReplay,
 	matchKey,
 	type DistanceKill,
 	type KillDistanceConfig
@@ -2107,25 +2108,66 @@ export async function dryRun(
 		const far = c.minDistanceM > 0 ? sql`AND distance_m >= ${c.minDistanceM}` : sql``;
 		const rows = await env.db.execute<{
 			ts: Date;
+			eventId: string;
+			eventTime: number;
 			steamId: string;
 			name: string | null;
+			victim: string;
 			cause: string | null;
 			distanceM: number | null;
 			matchRow: number | null;
 		}>(sql`
-			SELECT ts, killer_steam_id AS "steamId", killer_name AS name, cause,
-			       distance_m AS "distanceM", match_row AS "matchRow"
+			SELECT ts, event_id AS "eventId", event_time AS "eventTime", killer_steam_id AS "steamId",
+			       killer_name AS name, victim_steam_id AS victim, cause, distance_m AS "distanceM",
+			       match_row AS "matchRow"
 			  FROM kills
 			 WHERE server_id = ${server.id} AND ts >= ${since}
 			   AND killer_steam_id IS NOT NULL AND NOT suicide ${far}
 			   AND lower(cause) IN (SELECT jsonb_array_elements_text(${JSON.stringify(c.causes.map((x) => x.toLowerCase()))}::text::jsonb))
 			 ORDER BY ts ASC, event_time ASC LIMIT ${KILL_RATE_REPLAY_MAX}`);
+		// Those killers' own deaths from a little before, so a kill just after one is left out as
+		// the live rule leaves it out.
+		const killers = new Set<string>();
+		for (const r of rows) killers.add(r.steamId);
+		const deaths = killers.size
+			? await env.db.execute<{ ts: Date; eventId: string; eventTime: number; victim: string }>(sql`
+				SELECT ts, event_id AS "eventId", event_time AS "eventTime", victim_steam_id AS victim
+				  FROM kills
+				 WHERE server_id = ${server.id} AND ts >= ${new Date(since.getTime() - 120_000)}
+				   AND victim_steam_id IN (SELECT jsonb_array_elements_text(${JSON.stringify([...killers])}::text::jsonb))
+				 ORDER BY ts ASC, event_time ASC LIMIT ${KILL_RATE_REPLAY_MAX}`)
+			: [];
+		const event = (
+			ts: Date,
+			eventId: string,
+			eventTime: number,
+			killer: string | null,
+			victim: string
+		) => ({ eventId, eventTime: Number(eventTime), killer, victim, at: new Date(ts).getTime() });
+		const events: ReturnType<typeof event>[] = [];
+		for (const r of rows) events.push(event(r.ts, r.eventId, r.eventTime, r.steamId, r.victim));
+		for (const d of deaths) events.push(event(d.ts, d.eventId, d.eventTime, null, d.victim));
+		const afterDeath = killsAfterDeathReplay(
+			events.sort((a, b) => a.at - b.at || a.eventTime - b.eventTime)
+		);
 		const counted: DistanceKill[] = [];
+		let afterDeathInWindow = 0;
 		for (const r of rows) {
-			const distanceM = r.distanceM === null ? null : Number(r.distanceM);
-			if (!countsForDistance(c, { killer: r.steamId, suicide: false, cause: r.cause, distanceM }))
-				continue;
 			const at = new Date(r.ts).getTime();
+			const distanceM = r.distanceM === null ? null : Number(r.distanceM);
+			const afterOwnDeath = afterDeath.has(r.eventId);
+			if (
+				!countsForDistance(c, {
+					killer: r.steamId,
+					suicide: false,
+					afterOwnDeath,
+					cause: r.cause,
+					distanceM
+				})
+			) {
+				if (afterOwnDeath && at >= from.getTime()) afterDeathInWindow++;
+				continue;
+			}
 			counted.push({
 				at,
 				match: matchKey(r.matchRow === null ? null : Number(r.matchRow), at),
@@ -2150,6 +2192,10 @@ export async function dryRun(
 		result.notes.push(
 			`${inWindow} kill${inWindow === 1 ? '' : 's'} with ${c.causes.length === 1 ? causeLabel(c.causes[0]) : 'the chosen weapons'} ${c.minDistanceM > 0 ? `from ${c.minDistanceM} m or more` : 'at any distance'} in the window, counted per match.`
 		);
+		if (afterDeathInWindow)
+			result.notes.push(
+				`${afterDeathInWindow} more came within a minute of the killer’s own death and ${afterDeathInWindow === 1 ? 'is' : 'are'} not counted: a vehicle’s shell that lands after the vehicle was destroyed comes credited to the gunner’s own weapon.`
+			);
 		if (rows.length >= KILL_RATE_REPLAY_MAX)
 			result.notes.push(
 				`Replayed the first ${KILL_RATE_REPLAY_MAX.toLocaleString('en')} such kills only.`
