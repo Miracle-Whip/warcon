@@ -84,6 +84,10 @@ const MATRIX: Record<string, Policy | typeof PER_LIST> = {
 	'PATCH api/orgs/[id]/roles/[roleId]': 'orgOwner',
 	'DELETE api/orgs/[id]/roles/[roleId]': 'orgOwner',
 	'POST api/orgs/[id]/roles/[roleId]/reset': 'orgOwner',
+	'GET api/orgs/[id]/seasons': 'orgOwner',
+	'POST api/orgs/[id]/seasons': 'orgOwner',
+	'PATCH api/orgs/[id]/seasons/[seasonId]': 'orgOwner',
+	'DELETE api/orgs/[id]/seasons/[seasonId]': 'orgOwner',
 	'GET api/orgs/[id]/webhooks': 'orgOwner',
 	'POST api/orgs/[id]/webhooks': 'orgOwner',
 	'PATCH api/orgs/[id]/webhooks/[webhookId]': 'orgOwner',
@@ -106,6 +110,17 @@ const MATRIX: Record<string, Policy | typeof PER_LIST> = {
 	'POST api/orgs/[id]/lists/import': 'listsOwner',
 	'POST api/orgs/[id]/lists/sync': 'lists',
 	'GET api/orgs/[id]/players': 'lists',
+	// its reserved-slot groups: whoever edits its reserved slots. "Group not found." is not one of
+	// the hidden answers, so a group looked up before the role check fails these lines.
+	'GET api/orgs/[id]/slot-groups': 'lists:reserve',
+	'POST api/orgs/[id]/slot-groups': 'lists:reserve',
+	'PATCH api/orgs/[id]/slot-groups/[groupId]': 'lists:reserve',
+	'DELETE api/orgs/[id]/slot-groups/[groupId]': 'lists:reserve',
+	'PUT api/orgs/[id]/slot-groups/[groupId]/switch': 'lists:reserve',
+	'GET api/orgs/[id]/slot-groups/[groupId]/entries': 'lists:reserve',
+	'POST api/orgs/[id]/slot-groups/[groupId]/entries': 'lists:reserve',
+	'PATCH api/orgs/[id]/slot-groups/[groupId]/entries/[steamId]': 'lists:reserve',
+	'DELETE api/orgs/[id]/slot-groups/[groupId]/entries/[steamId]': 'lists:reserve',
 
 	// a server: run by its org's owners
 	'GET api/servers': 'user',

@@ -6,8 +6,9 @@
 	import ConfigForm from '$lib/components/ConfigForm.svelte';
 	import TickReward from '$lib/components/TickReward.svelte';
 	import { sponsor as banners, loadSponsor } from '$lib/sponsor.svelte';
-	import { setScalarInText } from '$lib/config-doc';
+	import { getScalar, parseIni, setScalarInText } from '$lib/config-doc';
 	import { lockedKeys, S_SESSION } from '$lib/config-fields';
+	import { EVENT_FEED_SECTION, eventFeedLines, usesEventFeed } from '$lib/feed-setup';
 	import { fmtTime } from '$lib/format';
 	import type { ConfigDoc, ConfigResult, Status } from '$lib/types';
 	import type { PageProps } from './$types';
@@ -66,7 +67,16 @@
 			feedBusy = false;
 		}
 	}
-	/** One click: mint the token, write both keys into the config document, apply. */
+	// CL-516586 on: the feed is a list of endpoints in the RCON block that RCON cannot write, so
+	// the host pastes the lines into the file.
+	let eventFeed = $derived(usesEventFeed(doc?.sections));
+	let feedLines = $derived(
+		feed?.token ? eventFeedLines(feed.url, feed.token, data.server.name) : ''
+	);
+	/**
+	 * One click: mint the token; on a build that reads [WDServerFeed], write both keys into the
+	 * config document and apply.
+	 */
 	async function configureFeed() {
 		const writable = !readOnly;
 		feedBusy = true;
@@ -78,7 +88,12 @@
 			return;
 		}
 		feedBusy = false;
-		if (writable) await writeFeedConfig();
+		if (eventFeed)
+			toast(
+				'Token created. Paste the lines shown into ServerSettings.ini on the host, then restart the server.',
+				'ok'
+			);
+		else if (writable) await writeFeedConfig();
 		else
 			toast(
 				'Token created. The config document cannot be written from here, so set [WDServerFeed] Url and Token on the host by hand.',
@@ -89,12 +104,17 @@
 	async function rotateFeed() {
 		if (
 			!(await confirmDialog(
-				'Replace the token? The game keeps posting with the old one until the config is rewritten and the server restarts, and those posts will be refused.',
+				`Replace the token? The game keeps posting with the old one until ${eventFeed ? 'the new lines are in its file' : 'the config is rewritten'} and the server restarts, and those posts will be refused.`,
 				{ okLabel: 'Replace', danger: true }
 			))
 		)
 			return;
-		await feedAction(() => api('POST', feedPath), 'Token replaced. Write it to the config again.');
+		await feedAction(
+			() => api('POST', feedPath),
+			eventFeed
+				? 'Token replaced. Paste the new lines on the host and restart the server.'
+				: 'Token replaced. Write it to the config again.'
+		);
 	}
 	async function disableFeed() {
 		if (
@@ -232,17 +252,38 @@
 		if (failure) return;
 		await loadBanner(true);
 	}
+	const nameIn = (t: string) => getScalar(parseIni(t), S_SESSION, 'ServerName');
+	const nameless = (t: string) => setScalarInText(t, S_SESSION, 'ServerName', '');
+	/**
+	 * While a Live server name rule keeps the name, the document changes under an open page about
+	 * once a minute. A conflict where that line is all that changed since the page loaded, and not one
+	 * this page edited, is applied again over the newer revision with the name the rule wrote.
+	 */
+	async function overTheName(): Promise<ConfigResult | null> {
+		if (!doc || !data.liveName || nameIn(text) !== nameIn(doc.text)) return null;
+		const live = await rconGet<ConfigDoc>(id, 'config');
+		if (nameless(live.text) !== nameless(doc.text)) return null;
+		const merged = setScalarInText(text, S_SESSION, 'ServerName', nameIn(live.text) ?? '');
+		const r = await rconPost<ConfigResult>(id, 'configApply', {
+			text: merged,
+			revision: live.revision,
+			force: false
+		});
+		if (!r.conflict) text = merged;
+		return r;
+	}
 	async function runConfig(action: 'configValidate' | 'configApply') {
 		busy = true;
 		result = null;
 		failure = '';
 		lineErrors = [];
 		try {
-			const r = await rconPost<ConfigResult>(
+			let r = await rconPost<ConfigResult>(
 				id,
 				action,
 				action === 'configApply' ? { text, revision: doc?.revision, force } : { text }
 			);
+			if (r.conflict) r = (await overTheName()) ?? r;
 			if (r.conflict) {
 				failure = `${r.errorMessage || 'The config changed on the server since you loaded it.'} Reload to see the current version, or tick Force to overwrite.`;
 				return;
@@ -373,7 +414,18 @@
 			</span>
 		{/if}
 	</div>
-	{#if feed?.configured && feed.token}
+	{#if feed?.configured && feed.token && eventFeed}
+		<div class="flex items-start gap-2">
+			<pre
+				class="min-w-0 grow overflow-x-auto rounded-ctl border border-black bg-ink-950 px-2.5 py-1.5 font-mono text-[12.5px]">{feedLines}</pre>
+			<button class="btn btn-sm" onclick={() => copyFeed(feedLines, 'Lines')}>Copy</button>
+		</div>
+		<p class="mt-2 text-[12.5px] text-mist-600">
+			Add these lines under <span class="chip">[{EVENT_FEED_SECTION}]</span> in the server's ServerSettings.ini
+			on the host, in place of any earlier EventFeedEndpoints line for this panel, then restart the server.
+			RCON cannot write them: the game reads its feed endpoints from the file only.
+		</p>
+	{:else if feed?.configured && feed.token}
 		<div class="grid grid-cols-1 gap-3 md:grid-cols-[auto_1fr]">
 			<span class="text-[13px] text-mist-400 md:pt-1.5">Url</span>
 			<div class="flex items-center gap-2">
@@ -404,11 +456,15 @@
 		</div>
 	{/if}
 	<p class="note">
-		With <span class="chip">[WDServerFeed]</span> set, the game posts every kill (killer, victim,
-		weapon, distance, headshot) to Warcon a second or two after it happens: the kill feed on the
-		Overview tab, combat stats on Analytics and player dossiers, and the team-kill trigger.
-		{#if feed && !feed.configured}Configure writes the endpoint and a token into the config
-			document; the game reads them at its next restart (its own 24-hour one, or a manual restart).{:else if feed && !data.server.manager}An
+		{#if eventFeed}With <span class="chip">bEventFeedEnabled</span> on and an
+			<span class="chip">EventFeedEndpoints</span> entry for this panel in the server's file, the game{:else}With
+			<span class="chip">[WDServerFeed]</span> set, the game{/if} posts every kill (killer, victim, weapon,
+		distance, headshot) to Warcon a second or two after it happens: the kill feed on the Overview tab,
+		combat stats on Analytics and player dossiers, and the team-kill trigger.
+		{#if feed && !feed.configured && eventFeed}Configure creates the token and shows the lines to
+			paste into the file on the host; the game reads them when it starts.{:else if feed && !feed.configured}Configure
+			writes the endpoint and a token into the config document; the game reads them at its next
+			restart (its scheduled one, or a manual restart).{:else if feed && !data.server.manager}An
 			owner of the organisation holds the token.{/if}
 	</p>
 </div>
@@ -477,6 +533,7 @@
 			disabled={readOnly}
 			tickRange={tickKnown ? { min: tickMin, max: tickMax } : null}
 			liveRoutes={data.features.liveSettings}
+			nameRule={data.liveName ? `/server/${encodeURIComponent(id)}/automation` : null}
 		/>
 		<p class="note mt-4">
 			Fields edit the file one line at a time, so keys the form does not know (rotation entries, ban
