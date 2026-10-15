@@ -5,8 +5,10 @@ import {
 	bigint,
 	bigserial,
 	boolean,
+	check,
 	customType,
 	date,
+	doublePrecision,
 	index,
 	integer,
 	numeric,
@@ -200,7 +202,48 @@ export const organizations = pgTable('organizations', {
 	discordInviteUrl: text('discord_invite_url').notNull().default(''),
 	/** what a banned player is shown: the reason and facts about the ban, see $lib/ban-message */
 	banMessage: text('ban_message').notNull().default('{reason}'),
+	/** what the org's boards open on: official | custom | 30d | all ($lib/seasons, BOARD_OPENS) */
+	boardOpens: text('board_opens').notNull().default('official'),
+	/** the columns its public boards leave out ($lib/leaderboard, BOARD_COLUMNS); none = every one */
+	boardHidden: text('board_hidden')
+		.array()
+		.notNull()
+		.default(sql`'{}'::text[]`),
 	createdAt: ts('created_at').notNull().defaultNow(),
+	updatedAt: ts('updated_at').notNull().defaultNow()
+});
+
+/**
+ * A community's own season: a name and a start, running until its next season starts
+ * ($lib/seasons). Nothing is stored per player: its board is a range over the kept history. Once
+ * one has started its start stays put, so a finished season's standings never move.
+ */
+export const seasons = pgTable(
+	'seasons',
+	{
+		id: text('id').primaryKey(),
+		orgId: text('org_id')
+			.notNull()
+			.references(() => organizations.id, { onDelete: 'cascade' }),
+		name: text('name').notNull(),
+		startsAt: ts('starts_at').notNull(),
+		createdBy: text('created_by'),
+		createdAt: ts('created_at').notNull().defaultNow()
+	},
+	(t) => [uniqueIndex('seasons_org_start_uidx').on(t.orgId, t.startsAt)]
+);
+
+/**
+ * The org's quick reasons: the buttons under Reason in the ban dialog ($lib/ban-reasons). No row
+ * means the built-in six. Kept off `organizations`, whose whole row the worker reads with every
+ * server every few seconds.
+ */
+export const orgBanReasons = pgTable('org_ban_reasons', {
+	orgId: text('org_id')
+		.primaryKey()
+		.references(() => organizations.id, { onDelete: 'cascade' }),
+	/** BanReason[], in the order the buttons show */
+	reasons: jsonb('reasons').notNull(),
 	updatedAt: ts('updated_at').notNull().defaultNow()
 });
 
@@ -335,6 +378,11 @@ export const servers = pgTable('servers', {
 	publicLeaderboards: boolean('public_leaderboards').notNull().default(false),
 	/** the public status page also shows the last kills (needs the feed and the status page on) */
 	publicKills: boolean('public_kills').notNull().default(false),
+	/**
+	 * An owner's own restart time, `{ time: 'HH:MM' }` (UTC, $lib/uptime's ManualRestart), used
+	 * instead of the game's: null = the game decides (RestartTimeUtc, else 24 hours up).
+	 */
+	restartSchedule: jsonb('restart_schedule'),
 	createdBy: text('created_by'),
 	createdAt: ts('created_at').notNull().defaultNow(),
 	updatedAt: ts('updated_at').notNull().defaultNow()
@@ -542,6 +590,75 @@ export const kills = pgTable(
 	]
 );
 export type KillRow = typeof kills.$inferSelect;
+
+/**
+ * Every match state and result a server's feed reported (Season 2's `match_state` and
+ * `match_ended`, see docs/wardogs-api.md), as it arrived: the game's own record of its matches and
+ * the only account of its order and timing. A copy of a batch the game sends again is not stored
+ * twice, nor a state the same as the last one stored for the server (feed.ts counts it as a
+ * repeat). No player in it. History: never pruned, gone only with the server's stats purge; a
+ * TimescaleDB hypertable with compression where the extension exists (migration 0049).
+ */
+export const matchEvents = pgTable(
+	'match_events',
+	{
+		/** when Warcon received it */
+		ts: ts('ts').notNull(),
+		serverId: text('server_id').notNull(),
+		eventId: text('event_id').notNull(),
+		/** its place among its batch's events, which share `ts` */
+		seq: integer('seq').notNull(),
+		/** the game's serverId: a per-boot instance id */
+		instanceId: text('instance_id').notNull(),
+		/** match_state | match_ended */
+		type: text('type').notNull(),
+		/** the match clock, as sent */
+		eventTime: doublePrecision('event_time'),
+		/** null when the event named none (pre-match) */
+		matchId: text('match_id'),
+		/** the map's catalog id */
+		map: text('map').notNull(),
+		/** match_state: e.g. MatchState.PreMatch.WaitingForPlayers.PlayerCount */
+		state: text('state'),
+		/** match_ended: who was on */
+		players: integer('players'),
+		/** match_ended: `winningFaction` as the game sent it ('' when absent) */
+		winningFaction: text('winning_faction'),
+		/** match_ended: [{ name, score }], highest first */
+		scores: jsonb('scores')
+	},
+	(t) => [
+		// Not unique, as on kills: a hypertable's unique indexes must include ts.
+		index('match_events_event_idx').on(t.eventId),
+		index('match_events_server_ts_idx').on(t.serverId, t.ts.desc())
+	]
+);
+
+/**
+ * The names the kill feed showed for a player that were not the one the server's player list held
+ * for them then (a clan tag put on, taken off or swapped is the same name): one row per server,
+ * player and name, with when it was first and last shown and, when it read as another listed
+ * player's name, that player. Staff see them on the dossier as "in the kill feed as", and the
+ * Players searches match them. Written by the worker as kill batches come in (feed-events.ts) and,
+ * once, from the history (aliases.ts); kept for good. A name that differs is rare, so rows are few.
+ */
+export const playerAliases = pgTable(
+	'player_aliases',
+	{
+		serverId: text('server_id').notNull(),
+		steamId: text('steam_id').notNull(),
+		/** as the feed showed it */
+		name: text('name').notNull(),
+		/** the listed player whose name it read as, the last time it was someone else's */
+		holder: text('holder'),
+		firstSeen: ts('first_seen').notNull(),
+		lastSeen: ts('last_seen').notNull()
+	},
+	(t) => [
+		primaryKey({ columns: [t.serverId, t.steamId, t.name] }),
+		index('player_aliases_steam_idx').on(t.steamId)
+	]
+);
 
 /**
  * One row per player per match: the game's own scoreboard counters over the match (kills, deaths,
@@ -771,7 +888,11 @@ export const triggers = pgTable(
 				'kill_rate',
 				'two_teams',
 				'kill_distance',
-				'afk_protection'
+				'afk_protection',
+				'name_change',
+				'bounty',
+				'rotation_shuffle',
+				'live_name'
 			]
 		}).notNull(),
 		name: text('name').notNull(),
@@ -806,6 +927,8 @@ export const webhooks = pgTable(
 		urlHint: text('url_hint').notNull().default(''),
 		/** event classes to mirror; see webhook-delivery.ts */
 		events: jsonb('events').notNull(),
+		/** with Automation ticked, the kinds of rule it carries; null = every kind */
+		triggerKinds: jsonb('trigger_kinds'),
 		/** null = every server in the org */
 		serverIds: jsonb('server_ids'),
 		enabled: boolean('enabled').notNull().default(true),
@@ -923,8 +1046,11 @@ export const jsonWebhookPosts = pgTable(
 // ---- Organisation lists: bans and reserved slots kept in the panel and pushed to every server --
 
 /**
- * A ban list or reserved-slot list an org owns. Servers subscribe through server_lists: every org
- * list to every org server, and a server's own list (server_id set) to that server alone.
+ * A ban list or reserved-slot list an org owns. Servers subscribe through server_lists. Each org
+ * has one default list per kind (is_default), which every org server takes; a server's own list
+ * (server_id set) goes to that server alone. Any other org list is a reserved-slot group: on
+ * between on_from and on_until, on every server or the ones its server_lists rows name, archived
+ * rather than deleted.
  */
 export const lists = pgTable(
 	'lists',
@@ -937,6 +1063,16 @@ export const lists = pgTable(
 		serverId: text('server_id').references(() => servers.id, { onDelete: 'cascade' }),
 		kind: text('kind', { enum: ['ban', 'reserve'] }).notNull(),
 		name: text('name').notNull().default('Default'),
+		/** the org's own list of its kind, which members' slots, rules and import write to */
+		isDefault: boolean('is_default').notNull().default(false),
+		/** a group: on from here (null: since it was switched on) */
+		onFrom: ts('on_from'),
+		/** a group: off from here (null: until switched off); a group that was never on has its creation time */
+		onUntil: ts('on_until'),
+		/** a group: every server of the org, now and later; else the servers in server_lists */
+		everyServer: boolean('every_server').notNull().default(true),
+		/** a group taken away: off for good, its entries and servers kept for the history */
+		archivedAt: ts('archived_at'),
 		/** reserved for sharing between orgs; unused for now */
 		shareToken: text('share_token').unique(),
 		createdBy: text('created_by'),
@@ -945,11 +1081,28 @@ export const lists = pgTable(
 	},
 	(t) => [
 		uniqueIndex('lists_org_kind_name_uidx')
-			.on(t.orgId, t.kind, t.name)
-			.where(sql`${t.serverId} is null`),
+			.on(t.orgId, t.kind, sql`lower(${t.name})`)
+			.where(sql`${t.serverId} is null and ${t.archivedAt} is null`),
+		uniqueIndex('lists_org_default_uidx')
+			.on(t.orgId, t.kind)
+			.where(sql`${t.isDefault}`),
 		uniqueIndex('lists_server_kind_uidx')
 			.on(t.serverId, t.kind)
-			.where(sql`${t.serverId} is not null`)
+			.where(sql`${t.serverId} is not null`),
+		// an org list that is not the default is a reserved-slot group
+		check(
+			'lists_group_kind',
+			sql`${t.serverId} is not null or ${t.isDefault} or ${t.kind} = 'reserve'`
+		),
+		// only a group has a window, a choice of servers or an archive date
+		check(
+			'lists_group_shape',
+			sql`(${t.serverId} is null and not ${t.isDefault}) or (${t.onFrom} is null and ${t.onUntil} is null and ${t.everyServer} and ${t.archivedAt} is null)`
+		),
+		check(
+			'lists_window',
+			sql`${t.onFrom} is null or ${t.onUntil} is null or ${t.onFrom} < ${t.onUntil}`
+		)
 	]
 );
 
@@ -1003,7 +1156,11 @@ export const serverLists = pgTable(
 	]
 );
 
-/** The poller's copy of each game server's reserved slots; sibling of server_bans. */
+/**
+ * The poller's copy of each game server's reserved slots; sibling of server_bans. A row stands for
+ * an id in the config document, in the running list, or both: the live builds read the document
+ * at start, so between a write and the next restart the two differ.
+ */
 export const serverReserved = pgTable(
 	'server_reserved',
 	{
@@ -1011,6 +1168,10 @@ export const serverReserved = pgTable(
 			.notNull()
 			.references(() => servers.id, { onDelete: 'cascade' }),
 		steamId: text('steam_id').notNull(),
+		/** in the config document (the running list, on a build without one): what the sync plans against */
+		configured: boolean('configured').notNull().default(true),
+		/** in the running server's list: whom it holds a slot for now */
+		live: boolean('live').notNull().default(true),
 		seenAt: ts('seen_at').notNull().defaultNow()
 	},
 	(t) => [primaryKey({ columns: [t.serverId, t.steamId] })]
@@ -1072,6 +1233,10 @@ export const serverLive = pgTable('server_live', {
 	startedAt: ts('started_at'),
 	/** MaxReservedSlots from the config document: player slots held back for reserved players; null until read */
 	reservedSlots: integer('reserved_slots'),
+	/** RestartTimeUtc ("HH:MM") the running process started with; null when unset or not yet read */
+	restartTimeUtc: text('restart_time_utc'),
+	/** RestartTimeUtc as the config document holds it now (in effect from the next restart) */
+	restartTimeUtcFile: text('restart_time_utc_file'),
 	/** Status as the action registry shapes it */
 	status: jsonb('status'),
 	/** Player[] as the action registry shapes it */
@@ -1083,6 +1248,11 @@ export const serverLive = pgTable('server_live', {
 	observedAt: ts('observed_at'),
 	/** when the last kill feed batch arrived (written by the web process that took it) */
 	feedAt: ts('feed_at'),
+	/**
+	 * the last match state the feed reported, MatchStateView ({ state, map, at }); written by the
+	 * web process that took it, like feedAt, and left alone by the worker's upsert
+	 */
+	matchState: jsonb('match_state'),
 	updatedAt: ts('updated_at').notNull().defaultNow()
 });
 

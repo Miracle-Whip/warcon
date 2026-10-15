@@ -33,9 +33,11 @@ import { deliveries } from './metrics';
 import { NAME_FLAG } from './name-filter';
 import { KILL_RATE_FLAG } from './kill-rate';
 import { KILL_DISTANCE_FLAG, KILL_DISTANCE_SKIP } from './kill-distance';
+import { BOUNTY_CLAIM, BOUNTY_LAPSE, BOUNTY_REWARD } from './bounty';
 import { writeAudit } from './audit';
 import { PANEL_BAN, type PanelBanParams } from './rule-ban';
 import { killAndTell, RULE_KILL, RULE_KILL_MAX_AGE_MS } from './rule-kill';
+import { ROTATION_SHUFFLE, shuffleOnServer } from './rotation-shuffle';
 import { queueEvent } from './json-webhook-queue';
 import { seedRewardGranted } from './json-webhook-events';
 import {
@@ -54,7 +56,10 @@ const PANEL_ACTIONS = new Set([
 	NAME_FLAG,
 	KILL_RATE_FLAG,
 	KILL_DISTANCE_FLAG,
-	KILL_DISTANCE_SKIP
+	KILL_DISTANCE_SKIP,
+	BOUNTY_REWARD,
+	BOUNTY_CLAIM,
+	BOUNTY_LAPSE
 ]);
 
 /** The most rows one claim takes, oldest first. */
@@ -243,7 +248,7 @@ async function pass(): Promise<void> {
 			});
 		}
 	} catch (err) {
-		if (!(err instanceof LostOwnership)) console.error('[warcon] delivery pass', err);
+		if (!(err instanceof LostOwnership)) console.error('[warcon] delivery pass', forLog(err));
 	} finally {
 		loop.claiming = false;
 		claimFinished();
@@ -258,7 +263,7 @@ async function pass(): Promise<void> {
 async function deliverChain(env: Env, rows: OutboxRow[]): Promise<void> {
 	for (let i = 0; i < rows.length; i++) {
 		const after = await deliverOne(env, rows[i]).catch((err) => {
-			console.error('[warcon] delivery', err);
+			console.error('[warcon] delivery', forLog(err));
 		});
 		if (after === 'held') return putBack(env, rows.slice(i), WAITING);
 		if (after === 'refused') return putBack(env, rows.slice(i + 1), WAITING);
@@ -280,7 +285,7 @@ async function putBack(env: Env, rows: OutboxRow[], why?: string): Promise<void>
 		);
 	} catch (err) {
 		if (err instanceof LostOwnership) return; // the lease sweep marks them unknown
-		console.error('[warcon] outbox update', err);
+		console.error('[warcon] outbox update', forLog(err));
 		return;
 	}
 	for (const r of rows) emit({ type: 'outbox', serverId: r.serverId, id: r.id, state: 'pending' });
@@ -458,7 +463,7 @@ async function release(env: Env, row: OutboxRow): Promise<void> {
 		);
 	} catch (err) {
 		if (err instanceof LostOwnership) return; // the lease sweep marks it unknown
-		console.error('[warcon] outbox update', err);
+		console.error('[warcon] outbox update', forLog(err));
 	}
 }
 
@@ -470,15 +475,18 @@ async function release(env: Env, row: OutboxRow): Promise<void> {
  */
 async function deliverOne(env: Env, row: OutboxRow): Promise<'held' | 'refused' | void> {
 	if (row.action === 'seed_reward') return deliverSeedReward(env, row);
+	if (row.action === BOUNTY_REWARD) return deliverBountyReward(env, row);
 	if (row.action === PANEL_BAN) return deliverPanelBan(env, row);
-	// An alert-only Name filter match, a Kill rate or Kill distance flag, or a Kill distance rule's
-	// note of a kill it left out: the audit row (and, but for the note, its Discord card) is the
-	// whole delivery.
+	// An alert-only Name filter match, a Name change, Kill rate or Kill distance flag, a Kill
+	// distance rule's note of a kill it left out, or a bounty claimed or lapsed: the audit row (and,
+	// but for the Kill distance note, its Discord card) is the whole delivery.
 	if (
 		row.action === NAME_FLAG ||
 		row.action === KILL_RATE_FLAG ||
 		row.action === KILL_DISTANCE_FLAG ||
-		row.action === KILL_DISTANCE_SKIP
+		row.action === KILL_DISTANCE_SKIP ||
+		row.action === BOUNTY_CLAIM ||
+		row.action === BOUNTY_LAPSE
 	) {
 		const holds = await stillHolds(env, row);
 		if (holds === null) return release(env, row);
@@ -521,7 +529,7 @@ async function deliverOne(env: Env, row: OutboxRow): Promise<'held' | 'refused' 
 			env,
 			row,
 			'delivered',
-			((row.action === RULE_KILL || !OWN_WORDS.has(row.action)) && messageOf(result)) ||
+			((OWN_RESULT.has(row.action) || !OWN_WORDS.has(row.action)) && messageOf(result)) ||
 				row.okMessage
 		);
 		// Done, but a later step was refused for sending too fast (a rule kill's whisper): hold the
@@ -554,7 +562,12 @@ async function deliverOne(env: Env, row: OutboxRow): Promise<'held' | 'refused' 
 		else if (OWN_WORDS.has(row.action)) await finish(env, row, 'failed', refusal(err));
 		else if (err instanceof GameError || err instanceof ApiError)
 			await finish(env, row, 'failed', err.message);
-		else await finish(env, row, 'failed', err instanceof Error ? err.message : String(err));
+		else {
+			// the panel's own failure: the error goes to the log, a fixed phrase to the row (a failed
+			// query's message lists its parameters)
+			console.error('[warcon] delivery', forLog(err));
+			await finish(env, row, 'failed', 'The panel failed while sending it.');
+		}
 	} finally {
 		stats.inFlight--;
 	}
@@ -640,7 +653,79 @@ async function deliverSeedReward(env: Env, row: OutboxRow): Promise<void> {
 		);
 	} catch (err) {
 		if (err instanceof LostOwnership) return; // the lease sweep marks it unknown
-		await finish(env, row, 'failed', err instanceof Error ? err.message : String(err));
+		if (err instanceof ApiError) return await finish(env, row, 'failed', err.message);
+		// the error goes to the log, a fixed phrase to the row: a failed query lists its parameters
+		console.error('[warcon] seed reward', forLog(err));
+		await finish(env, row, 'failed', 'Could not write the reserved slot.');
+	} finally {
+		stats.inFlight--;
+	}
+}
+
+/**
+ * A claimed bounty's slot, like a Seeding reward's: the claimer goes on this server's reserved list or
+ * the organisation's for the rule's number of days from now, and the server is nudged to sync. A
+ * claimer who already holds a slot there that ends sooner has it made to last as long; one whose slot
+ * lasts as long or longer (or for good) keeps it as it is. Won slots do not go stale.
+ */
+async function deliverBountyReward(env: Env, row: OutboxRow): Promise<void> {
+	const p = row.params as {
+		steamId: string;
+		name: string;
+		reason: string;
+		slotDays: number;
+		scope: 'server' | 'org';
+	};
+	stats.inFlight++;
+	try {
+		if (!isOwner()) throw new LostOwnership();
+		const m = memoryOf(row.serverId);
+		const server = m?.server ?? (await getServer(env, row.serverId));
+		const org = m?.org ?? (server ? await getOrg(env, server.orgId) : null);
+		if (!server || !org) return await finish(env, row, 'skipped', 'Server no longer exists.');
+		const here = p.scope !== 'org';
+		const list = here
+			? await serverListOf(env, server, 'reserve')
+			: await listOf(env, org.id, 'reserve');
+		const expiresAt = new Date(Date.now() + p.slotDays * 86400_000);
+		const { added, lengthened } = await grantEntry(
+			env,
+			list,
+			{
+				steamId: p.steamId,
+				reason: p.reason,
+				expiresAt,
+				addedByName: `trigger: ${row.triggerName}`
+			},
+			{ lengthen: true }
+		);
+		if (!added && !lengthened)
+			return await finish(
+				env,
+				row,
+				'skipped',
+				`${p.name} already holds a reserved slot ${here ? `on ${server.name}` : `in ${org.name}`} that lasts as long or longer.`
+			);
+		// The next sync puts the slot on the server; this server syncs at its next look.
+		m?.reserved.add(p.steamId);
+		if (m) {
+			m.syncAt = 0;
+			gateway().observeSoon(row.serverId, { lists: true });
+		}
+		const until = expiresAt.toISOString().slice(0, 10);
+		await finish(
+			env,
+			row,
+			'delivered',
+			added
+				? `Reserved a slot for ${p.name} until ${until}.`
+				: `${p.name}'s reserved slot now lasts until ${until}.`
+		);
+	} catch (err) {
+		if (err instanceof LostOwnership) return; // the lease sweep marks it unknown
+		// the error goes to the log, a fixed phrase to the row: it may name what it failed on
+		console.error('[warcon] bounty reward', forLog(err));
+		await finish(env, row, 'failed', 'Could not write the reserved slot.');
 	} finally {
 		stats.inFlight--;
 	}
@@ -752,9 +837,12 @@ const retryAfterOf = (r: unknown): number =>
  * A rule's whisper, kick or kill carries what it tells one player, their stats across the
  * organisation among it: what became of it is told in the panel's own words, never the game's,
  * which staff of this server read (Recent actions, the audit trail, Discord) and which might repeat
- * the text. A kill says in its own fixed words whether the player was killed and told.
+ * the text. A kill says in its own fixed words whether the player was killed and told. A rotation
+ * shuffle writes the config document, whose refusals can quote the file.
  */
-const OWN_WORDS = new Set(['whisper', 'kick', RULE_KILL]);
+const OWN_WORDS = new Set(['whisper', 'kick', RULE_KILL, ROTATION_SHUFFLE]);
+/** Of those, the ones whose result is the panel's own account (names, counts), kept as it is. */
+const OWN_RESULT = new Set([RULE_KILL, ROTATION_SHUFFLE]);
 
 /** Why the game refused a whisper or kick, as a fixed phrase: its status and its code. */
 function refusal(err: unknown): string {
@@ -856,6 +944,7 @@ async function execute(client: WardogsClient, row: OutboxRow): Promise<unknown> 
 	const params = (row.params as Record<string, unknown>) ?? {};
 	if (row.action === AFK_ROUND) return afkRound(client, params, memoryOf(row.serverId));
 	if (row.action === RULE_KILL) return killAndTell(client, params);
+	if (row.action === ROTATION_SHUFFLE) return shuffleOnServer(client, params);
 	if (row.action === 'empty_reset') {
 		let rotationOn = false;
 		try {
@@ -896,7 +985,7 @@ async function finish(env: Env, row: OutboxRow, state: Outcome, outcome: string)
 		);
 	} catch (err) {
 		if (err instanceof LostOwnership) throw err;
-		console.error('[warcon] outbox update', err);
+		console.error('[warcon] outbox update', forLog(err));
 	}
 	// A panel action (a grant, a ban, a flag) can be delivered before the roster is in memory:
 	// audit it from the server row then.
@@ -917,7 +1006,7 @@ async function finish(env: Env, row: OutboxRow, state: Outcome, outcome: string)
 				state,
 				...((row.detail as Record<string, unknown>) ?? {})
 			}
-		).catch((err) => console.error('[warcon] delivery audit', err));
+		).catch((err) => console.error('[warcon] delivery audit', forLog(err)));
 	emit({ type: 'outbox', serverId: row.serverId, id: row.id, state });
 }
 
